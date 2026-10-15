@@ -1,0 +1,1519 @@
+/* Nile Youth Network Task Tracker: all behavior.
+   1) Paste your two Supabase values in the SETUP block just below.
+   2) The rest of the file is the app. */
+/* ================== SETUP: paste your Supabase details here ==================
+   Leave the two PASTE_... values as they are to run the built-in DEMO with sample data.
+   Supabase dashboard -> Project Settings -> API. Both values are safe to publish:
+   your data is protected by the access rules in supabase-setup.sql. */
+const SUPABASE_URL = 'PASTE_YOUR_SUPABASE_URL_HERE';
+const SUPABASE_ANON_KEY = 'PASTE_YOUR_SUPABASE_ANON_KEY_HERE';
+/* ============================================================================ */
+
+/* ---------- helpers ---------- */
+const $ = (s, r=document) => r.querySelector(s);
+function h(tag, props, ...kids){
+  const el = document.createElement(tag);
+  for (const k in (props||{})){
+    const v = props[k];
+    if (v===null || v===undefined || v===false) continue;
+    if (k==='class') el.className = v;
+    else if (k==='text') el.textContent = v;
+    else if (k==='style') el.setAttribute('style', v);
+    else if (k==='value') el.value = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v===true ? '' : v);
+  }
+  for (const kid of kids.flat(Infinity)){
+    if (kid===null || kid===undefined || kid===false) continue;
+    el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return el;
+}
+const rc = (el,...kids) => el.replaceChildren(...kids.flat(Infinity).filter(k=>k!==null&&k!==undefined&&k!==false));
+const pad = n => String(n).padStart(2,'0');
+const iso = d => d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());
+const parseD = s => { const [y,m,d]=s.split('-').map(Number); return new Date(y,m-1,d); };
+const todayStr = () => iso(new Date());
+const dShort = s => s ? parseD(s).toLocaleDateString(undefined,{day:'numeric',month:'short'}) : 'No date';
+const dLong = s => s ? parseD(s).toLocaleDateString(undefined,{weekday:'short',day:'numeric',month:'short',year:'numeric'}) : '';
+const diffDays = s => Math.round((parseD(s) - parseD(todayStr()))/864e5);
+const STATUS = {todo:'To do', progress:'In progress', done:'Done'};
+const PRIO = {low:'Low', med:'Medium', high:'High'};
+const isOver = t => t.status!=='done' && t.due && t.due < todayStr();
+function dueLabel(t){
+  if (!t.due) return 'No due date';
+  if (t.status==='done') return 'Completed';
+  const n = diffDays(t.due);
+  if (n<0) return 'Overdue by '+(-n)+' day'+(-n>1?'s':'');
+  if (n===0) return 'Due today';
+  if (n===1) return 'Due tomorrow';
+  return 'Due '+dShort(t.due);
+}
+function ago(ms){
+  const m = Math.round((Date.now()-ms)/60000);
+  if (m<1) return 'just now'; if (m<60) return m+' min ago';
+  const hr = Math.round(m/60); if (hr<24) return hr+' h ago';
+  const d = Math.round(hr/24); if (d<7) return d+' d ago';
+  return new Date(ms).toLocaleDateString(undefined,{day:'numeric',month:'short'});
+}
+function toast(msg, label, fn){
+  const host = $('#toastHost'); host.replaceChildren();
+  const el = h('div',{class:'toast',role:'status'}, msg, label ? h('button',{onclick:()=>{host.replaceChildren(); fn&&fn();}}, label) : null);
+  host.append(el); setTimeout(()=>{ if (el.isConnected) el.remove(); }, label ? 8000 : 3500);
+}
+function writeErr(e){
+  if (e && e.custom) return e.message;
+  if (e && (e.code==='42501' || /row-level security|permission/i.test(e.message||''))) return 'You do not have permission to do that. Ask an admin.';
+  return 'Could not save. Check your connection and try again.';
+}
+
+/* ---------- state ---------- */
+let sb=null, realtimeOn=false;
+const S = { tasks:[], meetings:[], minutes:[], profiles:{}, me:null, isAdmin:false, canWrite:false,
+  view:'main', calMonth:new Date(), calSel:null, filter:{person:'all',status:'all'}, q:'', team:'all',
+  stage:'boot', session:null, errMsg:'', rsvps:[], posts:[], confirms:[], goals:[], needUpdate:false, prioMine:false, goalWeek:null, canMedia:false, refocus:null, attachments:[], areaPosts:[], trainDocs:[], fin:[], budgets:[], settings:{}, finFilter:{month:'all',kind:'all',cat:'all',q:''}, docCat:'all', pos:'', canSchedule:false, canMinutes:false, canFinance:false, canTrain:false, isTrainer:false };
+const myId = () => (S.me && S.me.id) || null;
+const pn = id => { const p=S.profiles[id]; return (p&&p.name)||(p&&p.email?p.email.split('@')[0]:'')||'Team member'; };
+const myName = () => (S.me&&S.me.name)||(S.me&&S.me.email)||'A teammate';
+function nm(id){ if(!id) return 'Someone'; if(id===myId()) return 'You'; return pn(id); }
+function avatar(id,size=24){
+  return h('span',{class:'av ini',style:'width:'+size+'px;height:'+size+'px;font-size:'+Math.round(size*.45)+'px',text:(pn(id)[0]||'?').toUpperCase()});
+}
+const who = (id,size=22) => h('span',{class:'who'}, avatar(id,size), nm(id));
+
+/* ---------- Supabase data layer ---------- */
+const redirectUrl = () => location.origin + location.pathname;
+async function dbw(q){ const r=await q; if(r.error){ console.error(r.error); const e=new Error(r.error.message); e.code=r.error.code; throw e; } return r.data; }
+const tms = v => v ? new Date(v).getTime() : null;
+/* ---------- Data loading: only fetch what changed (keeps Supabase data transfer low) ---------- */
+const TABLES=['profiles','tasks','task_updates','meetings','minutes','meeting_rsvps','media_posts','media_confirmations','weekly_goals','attachments','area_posts','training_docs','finance_entries','finance_budgets','app_settings'];
+const CORE=['profiles','tasks','task_updates','meetings','minutes'];
+const DEP={tasks:['task_updates','attachments'],meetings:['meeting_rsvps','attachments'],media_posts:['media_confirmations','attachments'],minutes:['attachments'],finance_entries:['attachments'],area_posts:['attachments'],training_docs:['attachments']};
+const RAW={}, TBL_ERR={}, DIRTY=new Set(); let lastFull=0;
+const fetchTable = t => t==='task_updates' ? sb.from(t).select('*').order('created_at',{ascending:true}) : sb.from(t).select('*');
+function trackWrites(client){
+  const origFrom=client.from.bind(client);
+  client.from=t=>{ const b=origFrom(t);
+    ['insert','update','upsert','delete'].forEach(m=>{ const f=b[m]; if(typeof f!=='function') return; b[m]=function(...a){ DIRTY.add(t); if(m==='delete') (DEP[t]||[]).forEach(x=>DIRTY.add(x)); return f.apply(this,a); }; });
+    return b; };
+  const origRpc=client.rpc.bind(client); client.rpc=(...a)=>{ DIRTY.add('profiles'); return origRpc(...a); };
+}
+async function loadTables(names){
+  const list=[...new Set(names)];
+  const res=await Promise.all(list.map(fetchTable));
+  list.forEach((t,i)=>{ TBL_ERR[t]=!!res[i].error; if(!res[i].error) RAW[t]=res[i].data; else if(!CORE.includes(t)) RAW[t]=[]; });
+  const bad=list.findIndex((t,i)=>res[i].error&&CORE.includes(t));
+  if(bad>=0){ const er=res[bad].error; console.error(er); if(S.stage==='boot'){ S.stage='error'; S.errMsg='Could not load data: '+er.message+'. Did you run supabase-setup.sql?'; render(); } else toast('Could not refresh. Check your connection.'); return false; }
+  if(list.length===TABLES.length) lastFull=Date.now();
+  rebuild(); return true;
+}
+const loadAll = () => loadTables(TABLES);
+function rebuild(){
+  const rows=t=>RAW[t]||[], tms_=tms;
+  S.needUpdate=TABLES.filter(t=>!CORE.includes(t)).some(t=>TBL_ERR[t]);
+  S.profiles={}; rows('profiles').forEach(p=>{ S.profiles[p.id]={id:p.id,name:p.full_name||'',email:p.email||'',phone:p.phone||'',role:p.role,active:!!p.active,isComms:!!p.is_comms,position:p.committee_position||'',isTraining:!!p.is_training}; });
+  const ups={}; rows('task_updates').forEach(u=>{ (ups[u.task_id]=ups[u.task_id]||[]).push({id:u.id,by:u.user_id,at:tms_(u.created_at),text:u.text,kind:u.kind}); });
+  S.tasks=rows('tasks').map(r=>({id:r.id,title:r.title,description:r.description||'',ownerId:r.owner_id,due:r.due||'',priority:r.priority,team:r.team||'',status:r.status,progress:r.progress||0,mentions:r.mentions||[],checklist:r.checklist||[],updates:ups[r.id]||[],createdBy:r.created_by,createdAt:tms_(r.created_at),completedAt:tms_(r.completed_at),updatedAt:tms_(r.updated_at)}));
+  S.meetings=rows('meetings').map(r=>({id:r.id,title:r.title,date:r.date,time:r.time||'',place:r.place||'',agenda:r.agenda||'',kind:r.kind||'meeting',meetLink:r.meet_link||'',rsvpBy:r.rsvp_by||'',hostId:r.host_id||null,createdBy:r.created_by,createdAt:tms_(r.created_at)}));
+  S.minutes=rows('minutes').map(r=>({id:r.id,title:r.title,date:r.date,attendees:r.attendees||'',summary:r.summary||'',decisions:r.decisions||'',actions:r.actions||'',meetingId:r.meeting_id||null,createdBy:r.created_by,createdAt:tms_(r.created_at)}));
+  S.rsvps=rows('meeting_rsvps').map(r=>({id:r.id,meetingId:r.meeting_id,userId:r.user_id,response:r.response,comment:r.comment||''}));
+  S.posts=rows('media_posts').map(r=>({id:r.id,title:r.title,platform:r.platform||'',caption:r.caption||'',link:r.link||'',postDate:r.post_date||'',confirmBy:r.confirm_by||'',status:r.status,createdBy:r.created_by,createdAt:tms_(r.created_at)}));
+  S.confirms=rows('media_confirmations').map(r=>({id:r.id,postId:r.post_id,userId:r.user_id,response:r.response,comment:r.comment||''}));
+  S.goals=rows('weekly_goals').map(r=>({id:r.id,userId:r.user_id,week:r.week_start,text:r.text,done:!!r.done}));
+  S.attachments=rows('attachments').map(r=>({id:r.id,kind:r.owner_kind,ownerId:String(r.owner_id),name:r.name||'',path:r.path||'',url:r.url||'',mime:r.mime||'',size:Number(r.size)||0,by:r.uploaded_by,at:tms_(r.created_at)}));
+  S.areaPosts=rows('area_posts').map(r=>({id:r.id,area:r.area,kind:r.kind||'Note',title:r.title,body:r.body||'',createdBy:r.created_by,createdAt:tms_(r.created_at)}));
+  S.trainDocs=rows('training_docs').map(r=>({id:r.id,title:r.title,category:r.category||'Other',date:r.doc_date||'',description:r.description||'',createdBy:r.created_by}));
+  S.fin=rows('finance_entries').map(r=>({id:r.id,date:r.entry_date,kind:r.kind,category:r.category||'',description:r.description||'',party:r.party||'',amount:Number(r.amount)||0,createdBy:r.created_by}));
+  S.budgets=rows('finance_budgets').map(r=>({id:r.id,category:r.category,amount:Number(r.amount)||0}));
+  S.settings={}; rows('app_settings').forEach(r=>{ S.settings[r.key]=r.value; });
+}
+
+function afterLoad(){
+  const p=S.profiles[myId()];
+  if(!p){ S.stage='error'; S.errMsg='Your profile was not found. Make sure supabase-setup.sql was run, then sign out and sign in again.'; render(); return; }
+  S.me={...S.me,name:p.name,role:p.role,phone:p.phone};
+  S.isAdmin=p.role==='admin'&&p.active; S.canWrite=p.active; S.pos=p.position||''; const lead=['chair','vice_chair','secretary'].includes(S.pos);
+  S.canSchedule=p.active&&(p.role==='admin'||lead); S.canMinutes=S.canSchedule; S.canFinance=p.active&&(p.role==='admin'||S.pos==='treasurer'); S.isTrainer=p.active&&p.isTraining; S.canTrain=p.active&&(p.role==='admin'||p.isTraining); S.canMedia=p.active&&(p.role==='admin'||p.isComms||S.pos==='communication');
+  S.stage=p.active?'app':'pending';
+  render(); paintTask();
+}
+/* After you save something, only the changed tables are reloaded. Other people's changes arrive live. */
+async function reload(arg){
+  if(!sb||!S.session) return;
+  const names=Array.isArray(arg)?arg:(DIRTY.size?[...DIRTY]:TABLES);
+  names.forEach(n=>DIRTY.delete(n));
+  if(await loadTables(names)) afterLoad();
+}
+let rtOk=false; const pendingT=new Set(); let pendingTimer=null;
+const queueTable=t=>{ pendingT.add(t); clearTimeout(pendingTimer); pendingTimer=setTimeout(()=>{ const names=[...pendingT]; pendingT.clear(); reload(names); },400); };
+function subscribeRealtime(){
+  if(realtimeOn) return; realtimeOn=true;
+  const ch=sb.channel('nyn-live');
+  TABLES.filter(t=>CORE.includes(t)||!S.needUpdate).forEach(t=>ch.on('postgres_changes',{event:'*',schema:'public',table:t},()=>queueTable(t)));
+  ch.subscribe(st=>{ rtOk=(st==='SUBSCRIBED'); });
+}
+
+async function startSession(){
+  if(!S.session){ S.stage='login'; S.me=null; S.isAdmin=false; S.canWrite=false; S.tasks=[]; S.meetings=[]; S.minutes=[]; S.profiles={}; S.rsvps=[]; S.posts=[]; S.confirms=[]; S.goals=[]; S.attachments=[]; S.areaPosts=[]; S.trainDocs=[]; S.fin=[]; S.budgets=[]; S.settings={}; S.canMedia=false; S.canSchedule=false; S.canMinutes=false; S.canFinance=false; S.canTrain=false; S.isTrainer=false; S.pos=''; render(); return; }
+  S.me={id:S.session.user.id,email:S.session.user.email,name:''}; S.stage='boot'; render();
+  if(await loadAll()){ afterLoad(); subscribeRealtime(); }
+}
+async function signOut(){ if(DEMO){ demoSwitch('login'); return; } if(sb) await sb.auth.signOut(); }
+async function init(){
+  const configured=/^https:\/\//.test(SUPABASE_URL) && !/PASTE/.test(SUPABASE_ANON_KEY);
+  if(!configured){ DEMO=true; demoDB=demoSeed(); sb=makeDemoClient(); trackWrites(sb); demoSwitch('chair'); return; }
+  if(!window.supabase){ S.stage='error'; S.errMsg='The Supabase library could not load. Check your internet connection and refresh.'; render(); return; }
+  sb=window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY); trackWrites(sb);
+  try{ const {data}=await sb.auth.getSession(); S.session=data.session; }catch(e){ S.session=null; }
+  sb.auth.onAuthStateChange((ev,session)=>{ const had=!!S.session; S.session=session; if(!!session!==had) setTimeout(startSession,0); });
+  await startSession();
+}
+
+/* ---------- people picker ---------- */
+function picker({multi=false, ids=[], placeholder='Search teammates…'}){
+  let sel = [...ids];
+  const chips = h('span',{style:'display:contents'});
+  const input = h('input',{type:'text',placeholder,autocomplete:'off','aria-label':placeholder});
+  const list = h('div',{class:'plist',hidden:true});
+  const box = h('div',{class:'picker'}, chips, input, list);
+  function paint(){
+    chips.replaceChildren(...sel.map(id=>h('span',{class:'chip'}, avatar(id,20), nm(id),
+      h('button',{type:'button',class:'x','aria-label':'Remove '+nm(id),onclick:()=>{ sel=sel.filter(x=>x!==id); paint(); }},'×'))));
+    if (!multi) input.placeholder = sel.length ? 'Change person…' : placeholder;
+  }
+  async function search(){
+    const qv=input.value.trim().toLowerCase();
+    const hits=Object.values(S.profiles).filter(p=>p.active&&(!qv||(p.name+' '+p.email).toLowerCase().includes(qv))).slice(0,8);
+    const rows = hits.filter(p=>!sel.includes(p.id)).map(p=>h('button',{type:'button',class:'popt',onmousedown:e=>e.preventDefault(),onclick:()=>{
+      if (multi) sel.push(p.id); else sel=[p.id];
+      input.value=''; list.hidden=true; paint();
+    }}, avatar(p.id,22), pn(p.id)+(p.id===myId()?' (you)':'')));
+    list.replaceChildren(...(rows.length?rows:[h('div',{class:'pempty',text:'No match. Only approved team members can be picked.'})]));
+    list.hidden=false;
+  }
+  input.addEventListener('focus',search); input.addEventListener('input',search);
+  input.addEventListener('blur',()=>setTimeout(()=>{list.hidden=true;},150));
+  paint();
+  return { el:box, get:()=>[...sel], set:v=>{sel=[...v];paint();} };
+}
+
+/* ---------- render ---------- */
+const ICONS={
+  main:'<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
+  mine:'<rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 12l3 3 5-6"/>',
+  goals:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.2"/>',
+  meetings:'<rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3"/>',
+  calendar:'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  media:'<path d="M3 11v2a1 1 0 0 0 1 1h3l7 4V6L7 10H4a1 1 0 0 0-1 1z"/><path d="M18 9a4 4 0 0 1 0 6"/>',
+  admin:'<path d="M5 20V10M12 20V4M19 20v-7"/>',
+  team:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><circle cx="17" cy="9" r="2.5"/><path d="M17 14.5a5 5 0 0 1 4.5 5"/>',
+  leadership:'<path d="M12 3l2.6 5.4 5.9.8-4.3 4.1 1 5.9L12 16.5 6.8 19.2l1-5.9L3.5 9.2l5.9-.8z"/>',
+  secretariat:'<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/>',
+  advocacy:'<path d="M5 21V4"/><path d="M5 4h11l-2 4 2 4H5"/>',
+  finance:'<circle cx="12" cy="12" r="9"/><path d="M14.5 9.2c-.5-.8-1.4-1.2-2.5-1.2-1.5 0-2.5.8-2.5 2s1 1.7 2.5 2 2.5.8 2.5 2-1 2-2.5 2c-1.1 0-2-.4-2.5-1.2M12 6.5V8m0 8v1.5"/>',
+  projects:'<rect x="3" y="4" width="5" height="16" rx="1.5"/><rect x="10" y="4" width="5" height="10" rx="1.5"/><rect x="17" y="4" width="4" height="6" rx="1.5"/>',
+  training:'<path d="M2 9l10-5 10 5-10 5z"/><path d="M6 11v5c0 1.5 3 3 6 3s6-1.5 6-3v-5"/>'
+};
+function icon(n){ const s=h('span',{class:'ic','aria-hidden':'true'}); s.innerHTML='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'+(ICONS[n]||'')+'</svg>'; return s; }
+const NAV = [
+  [null,[['main','Main board','blue'],['mine','My board','blue'],['goals','Weekly goals','green'],['meetings','Meetings & events','blue'],['calendar','Calendar','blue']]],
+  ['Work areas',[['leadership','Leadership','blue'],['secretariat','Secretariat','amber'],['advocacy','Advocacy','purple'],['media','Media','pink'],['finance','Finance','green'],['projects','Projects','teal'],['training','Training','orange']]],
+  ['Admin',[['admin','Admin board','blue'],['team','Team','blue']]]
+];
+const ADMIN_ONLY = ['admin','team'];
+function render(){
+  const view=$('#view'), nav=$('#nav'), inApp=S.stage==='app';
+  const ub=$('#userBtn'); ub.hidden=!S.session; if(S.session) ub.textContent=(S.me&&(S.me.name||S.me.email))||'Account';
+  $('#newTaskTop').hidden=!(inApp&&S.canWrite);
+  $('#side').hidden=!inApp; document.querySelector('.layout').classList.toggle('nosid',!inApp);
+  if(!inApp){ nav.replaceChildren(); $('#overPill').replaceChildren(); view.replaceChildren(gateView()); return; }
+  const me=myId(), today=todayStr();
+  const overdue=S.tasks.filter(isOver), pending=Object.values(S.profiles).filter(p=>!p.active).length;
+  const needRsvp=S.meetings.filter(m=>m.date>=today&&!S.rsvps.some(r=>r.meetingId===m.id&&r.userId===me)).length;
+  const needConfirm=S.posts.filter(p=>p.status!=='published'&&!S.confirms.some(c=>c.postId===p.id&&c.userId===me)).length;
+  const badges={team:[pending,''],meetings:[needRsvp,' b'],media:[needConfirm,' b']};
+  const items=[];
+  NAV.forEach(([label,list])=>{ const vis=list.filter(([k])=>!ADMIN_ONLY.includes(k)||S.isAdmin); if(!vis.length) return; if(label) items.push(h('div',{class:'navh',text:label}));
+    vis.forEach(([k,l,acc])=>{ const b=badges[k]; items.push(h('button',{class:'acc-'+acc,'aria-current':S.view===k?'page':null,onclick:()=>go(k)},icon(k),l,(b&&b[0])?h('span',{class:'badge'+b[1],text:b[0]}):null)); }); });
+  nav.replaceChildren(...items);
+  $('#overPill').replaceChildren(...(overdue.length?[h('button',{class:'pill-over',onclick:()=>go('main')}, h('span',{class:'pulse-dot'}), overdue.length+' overdue')]:[]));
+  if (ADMIN_ONLY.includes(S.view) && !S.isAdmin) S.view='main';
+  view.replaceChildren();
+  if(S.needUpdate) view.append(h('div',{class:'banner',text:'The database is missing some tables for the newest features. Run supabase-setup.sql again in the Supabase SQL Editor (see the README), then refresh this page.'}));
+  const AV={leadership:1,secretariat:1,advocacy:1,projects:1};
+  if(AV[S.view]) return areaView(view,S.view);
+  ({main:mainView,mine:mineView,goals:goalsView,meetings:meetingsView,calendar:calendarView,media:mediaView,finance:financeView,training:trainingView,admin:adminView,team:teamView}[S.view]||mainView)(view, overdue);
+}
+function gateView(){
+  if(S.stage==='setup') return h('div',{class:'panel',style:'max-width:560px;margin:30px auto'},h('h3',{text:'Connect your Supabase project'}),h('p',{text:'Open index.html and paste your Supabase Project URL and anon key at the top of the script (look for SETUP). The README explains every step.'}));
+  if(S.stage==='boot') return h('p',{class:'empty',text:'Loading the team board…'});
+  if(S.stage==='error') return h('div',{class:'panel',style:'max-width:560px;margin:30px auto'},h('h3',{text:'Something needs attention'}),h('p',{text:S.errMsg}),S.session?h('button',{class:'btn',onclick:signOut},'Sign out'):null);
+  if(S.stage==='pending') return h('div',{class:'panel',style:'max-width:560px;margin:30px auto'},h('h3',{text:'Waiting for approval'}),h('p',{text:'Your account is created. An admin must approve it before you can see the team board. Ask them to open the Team tab and approve '+((S.me&&S.me.email)||'your email')+'.'}),h('div',{class:'actions',style:'justify-content:flex-start'},h('button',{class:'btn',onclick:reload},'Check again'),h('button',{class:'btn',onclick:signOut},'Sign out')));
+  return loginView();
+}
+function loginView(){
+  const name=h('input',{type:'text',placeholder:'Your name (for new accounts)',autocomplete:'name'});
+  const email=h('input',{type:'text',placeholder:'you@example.com',autocomplete:'email',inputmode:'email'});
+  const pw=h('input',{type:'password',placeholder:'Password (at least 6 characters)',autocomplete:'current-password',style:'width:100%;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:9px 11px'});
+  const msg=h('div',{class:'hint',role:'status',style:'min-height:20px;margin-top:8px'});
+  const say=(t,bad)=>{ msg.textContent=t; msg.className=bad?'red':'hint'; };
+  const need=()=>{ if(!/.+@.+\..+/.test(email.value.trim())){ say('Enter a valid email address.',true); return false; } return true; };
+  const run=async fn=>{ try{ await fn(); }catch(e){ say((e&&e.message)||'Something went wrong.',true); } };
+  return h('div',{class:'panel',style:'max-width:440px;margin:30px auto'},
+    brandLogo?h('img',{class:'login-logo',src:brandLogo,alt:'Nile Youth Network logo'}):null,
+    h('h2',{style:'color:var(--navy);margin-bottom:4px',text:'Welcome'}), h('p',{class:'hint',style:'margin:0 0 14px',text:'Sign in to the Nile Youth Network task tracker.'}),
+    field('Name',name), field('Email',email), field('Password',pw),
+    h('div',{class:'actions',style:'justify-content:flex-start'},
+      h('button',{class:'btn primary',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.signInWithPassword({email:email.value.trim(),password:pw.value}); if(error) say(error.message,true); })},'Sign in'),
+      h('button',{class:'btn',onclick:()=>need()&&run(async()=>{ if(pw.value.length<6){ say('Use a password of at least 6 characters.',true); return; } const {data,error}=await sb.auth.signUp({email:email.value.trim(),password:pw.value,options:{data:{full_name:name.value.trim()},emailRedirectTo:redirectUrl()}}); if(error){ say(error.message,true); return; } if(!data.session) say('Account created. Check your email to confirm it, then sign in.'); })},'Create account'),
+      h('button',{class:'btn ghost',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.signInWithOtp({email:email.value.trim(),options:{emailRedirectTo:redirectUrl(),data:{full_name:name.value.trim()}}}); say(error?error.message:'Login link sent. Check your email.',!!error); })},'Email me a login link')),
+    msg);
+}
+function teamView(view){
+  const ppl=Object.values(S.profiles).sort((a,b)=>(a.active===b.active?0:a.active?1:-1)||pn(a.id).localeCompare(pn(b.id)));
+  view.append(h('div',{class:'page-head'},h('div',{},h('h2',{text:'Team'}),h('p',{text:'Approve new people, choose admins, and assign the committee positions. Each position gets its own work area. The Chair person and the Secretary general become admins automatically.'}))));
+  const setP=async(id,role,active)=>{ try{ await dbw(sb.rpc('admin_set_profile',{target:id,new_role:role,new_active:active})); await reload(); toast('Saved'); }catch(e){ toast(writeErr(e)); } };
+  const setPos=async(id,position,training)=>{ try{ await dbw(sb.rpc('admin_set_position',{target:id,new_position:position,new_training:training})); await reload(); toast(['chair','secretary'].includes(position)?'Saved. This person is now an admin too.':'Saved'); }catch(e){ toast(writeErr(e)); } };
+  view.append(h('div',{class:'panel acc-blue'}, ppl.length?ppl.map(p=>{
+    const me=p.id===myId();
+    const role=h('select',{'aria-label':'Role for '+pn(p.id),disabled:me?'':null,onchange:e=>setP(p.id,e.target.value,p.active)},h('option',{value:'member',text:'Member'}),h('option',{value:'admin',text:'Admin'})); role.value=p.role;
+    const pos=h('select',{'aria-label':'Position for '+pn(p.id),disabled:p.active?null:'',onchange:e=>setPos(p.id,e.target.value,p.isTraining)},h('option',{value:'',text:'No position'}),...Object.entries(POSITIONS).map(([k,l])=>h('option',{value:k,text:l}))); pos.value=p.position||'';
+    return h('div',{class:'row'}, avatar(p.id,30), h('div',{class:'grow'},h('div',{class:'t',text:pn(p.id)+(me?' (you)':'')}),h('div',{class:'s',text:p.email+(p.phone?' · '+p.phone:'')})),
+      h('span',{class:'tag '+(p.active?'done':'over'),text:p.active?'Approved':'Waiting for approval'}),
+      pos,
+      h('label',{class:'chk'},h('input',{type:'checkbox',checked:p.isTraining?'':null,disabled:p.active?null:'',onchange:e=>setPos(p.id,p.position||'',e.target.checked)}),'Trainer'),
+      role, me?null:h('button',{class:'btn small'+(p.active?'':' primary'),onclick:()=>setP(p.id,p.role,!p.active)},p.active?'Deactivate':'Approve'));
+  }):h('p',{class:'empty',text:'No people yet.'})));
+}
+$('#userBtn').addEventListener('click',()=>{
+  const p=S.profiles[myId()]||{};
+  const name=h('input',{type:'text',value:p.name||''}), phone=h('input',{type:'text',value:p.phone||'',placeholder:'+251911223344',inputmode:'tel'});
+  openForm('My profile',[field('Name',name),field('WhatsApp number',phone,'Include the country code. Teammates can then message you directly on WhatsApp.'),h('div',{class:'field'},h('label',{class:'chk'},h('input',{type:'checkbox',checked:bgOn()?'':null,onchange:e=>setBg(e.target.checked)}),'Show the Nile picture in the menu and background')),h('div',{class:'field'},h('button',{class:'btn small',onclick:()=>{ $('#dForm').close(); signOut(); }},'Sign out'))],async()=>{
+    await dbw(sb.from('profiles').update({full_name:name.value.trim(),phone:phone.value.trim()}).eq('id',myId())); await reload(); toast('Profile saved');
+  });
+});
+$('#newTaskTop').addEventListener('click',()=>taskForm());
+
+/* ---------- task pieces ---------- */
+function taskCard(t){
+  const over = isOver(t);
+  return h('article',{class:'tcard'+(over?' over':'')+(t.status==='done'?' done':''),tabindex:0,role:'button',onclick:()=>openTask(t.id),onkeydown:e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openTask(t.id);}}},
+    h('div',{class:'tc-top'}, over?h('span',{class:'pulse-dot',title:'Overdue'}):null, h('span',{class:'prio p-'+(t.priority||'med'),text:PRIO[t.priority||'med']}), t.team?h('span',{class:'hint',text:t.team}):null, (t.mentions&&t.mentions.length)?h('span',{class:'hint',text:'@'+t.mentions.length}):null),
+    h('h4',{text:t.title}),
+    h('div',{class:'bar'},h('i',{style:'width:'+(t.progress||0)+'%'})),
+    h('div',{class:'tc-meta'}, h('span',{class:over?'red':'',text:dueLabel(t)+(t.progress?' · '+t.progress+'%':'')+(t.checklist&&t.checklist.length?' · '+t.checklist.filter(c=>c.done).length+'/'+t.checklist.length+' steps':'')}), t.ownerId?avatar(t.ownerId,24):null));
+}
+function taskRow(t){
+  const over = isOver(t);
+  return h('div',{class:'row clickable',onclick:()=>openTask(t.id)},
+    over?h('span',{class:'pulse-dot'}):h('span',{class:'tag '+t.status,text:STATUS[t.status]}),
+    h('div',{class:'grow'}, h('div',{class:'t',text:t.title}), h('div',{class:'s'}, t.ownerId?nm(t.ownerId)+' · ':'', h('span',{class:over?'red':'',text:dueLabel(t)}))),
+    t.ownerId?avatar(t.ownerId,26):null);
+}
+const byDue = (a,b) => (a.due||'9999').localeCompare(b.due||'9999');
+function greeting(){ const hr=new Date().getHours(); return hr<12?'Good morning':hr<17?'Good afternoon':'Good evening'; }
+
+/* ---------- search & team filter ---------- */
+const teamsList=()=>[...new Set(S.tasks.map(t=>(t.team||'').trim()).filter(Boolean))].sort();
+const effTeam=()=>teamsList().includes(S.team)?S.team:'all';
+const matches=t=>{
+  if(effTeam()!=='all'&&(t.team||'')!==S.team) return false;
+  const q=S.q.trim().toLowerCase(); if(!q) return true;
+  return (t.title+' '+(t.description||'')+' '+(t.team||'')+' '+(t.ownerId?nm(t.ownerId):'')).toLowerCase().includes(q);
+};
+let qT=null;
+function filterBar(){
+  const q=h('input',{type:'text',placeholder:'Search tasks, people or teams…','aria-label':'Search tasks',value:S.q});
+  q.addEventListener('input',()=>{ S.q=q.value; clearTimeout(qT); qT=setTimeout(()=>{ render(); const n=document.querySelector('#view input[aria-label="Search tasks"]'); if(n){ n.focus(); n.setSelectionRange(n.value.length,n.value.length); } },250); });
+  const tm=h('select',{'aria-label':'Filter by team',onchange:e=>{S.team=e.target.value;render();}},h('option',{value:'all',text:'All teams'}),...teamsList().map(x=>h('option',{value:x,text:x})));
+  tm.value=effTeam();
+  return h('div',{class:'filters'},q,tm);
+}
+
+/* ---------- Attachments: files, videos and links ---------- */
+const FILE_MAX = 50*1024*1024;
+const urlCache = {};
+const attsFor = (kind,id) => S.attachments.filter(a=>a.kind===kind && a.ownerId===String(id));
+const fmtSize = n => !n?'':n<1024?n+' B':n<1048576?Math.round(n/1024)+' KB':(n/1048576).toFixed(1)+' MB';
+function attKind(a){ const m=a.mime||''; if(a.url&&!a.path) return 'link'; if(m.startsWith('image/')) return 'image'; if(m.startsWith('video/')) return 'video'; if(m.startsWith('audio/')) return 'audio'; if(m==='application/pdf') return 'pdf'; return 'file'; }
+const extLabel = a => { const k=attKind(a); if(k==='link') return 'LINK'; if(k==='pdf') return 'PDF'; const m=(a.name||'').match(/\.([A-Za-z0-9]{1,4})$/); return m?m[1].toUpperCase():'FILE'; };
+async function ensureUrls(list){
+  const need=list.filter(a=>a.path && !(urlCache[a.path] && urlCache[a.path].exp>Date.now()));
+  if(!need.length) return;
+  try{
+    const {data}=await sb.storage.from('attachments').createSignedUrls(need.map(a=>a.path),3600);
+    (data||[]).forEach(d=>{ if(d && d.signedUrl) urlCache[d.path]={url:d.signedUrl,exp:Date.now()+3300e3}; });
+  }catch(e){ console.error(e); }
+}
+const urlOf = a => a.path ? (urlCache[a.path] && urlCache[a.path].url) : a.url;
+function attItem(a,onRemove){
+  const k=attKind(a), u=urlOf(a), name=a.name||'file';
+  let body;
+  if(k==='image' && u) body=h('a',{href:u,target:'_blank',rel:'noopener',class:'att-img'},h('img',{src:u,alt:name,loading:'lazy'}));
+  else if(k==='video' && u){ const v=h('video',{controls:'',preload:'metadata',playsinline:'','aria-label':name}); v.src=u; body=h('div',{class:'att-vid'},v); }
+  else if(k==='audio' && u){ const au=h('audio',{controls:'','aria-label':name}); au.src=u; body=au; }
+  else {
+    let sub=a.size?fmtSize(a.size):''; if(k==='link'){ try{ sub=new URL(a.url).hostname; }catch(e){ sub='link'; } }
+    body=h('a',{href:u||null,target:'_blank',rel:'noopener',class:'att-file'+(u?'':' wait')},h('span',{class:'att-ic',text:extLabel(a)}),h('span',{},h('span',{class:'nm',text:name}),h('small',{text:u?sub:'Loading…'})));
+  }
+  const can=onRemove && (a.by===myId() || S.isAdmin);
+  return h('div',{class:'att att-'+k},body,can?h('button',{class:'att-x',type:'button','aria-label':'Remove '+name,onclick:e=>{ e.stopPropagation(); onRemove(a); }},'×'):null);
+}
+const removeAttUI = async a => { try{ await removeAtt(a); toast('Removed'); }catch(e){ toast(writeErr(e)); } };
+function attList(kind,id){
+  const list=attsFor(kind,id); if(!list.length) return null;
+  const box=h('div',{class:'atts'});
+  const paint=()=>box.replaceChildren(...list.map(a=>attItem(a,removeAttUI)));
+  paint(); if(list.some(a=>a.path && !urlOf(a))) ensureUrls(list).then(paint);
+  return box;
+}
+function attCount(kind,id){ const n=attsFor(kind,id).length; return n?h('span',{class:'tag cnt',text:n+' attachment'+(n>1?'s':'')}):null; }
+async function shrinkImage(file){
+  if(!/^image\/(jpeg|png|webp)$/.test(file.type)||file.size<400*1024) return file;
+  try{
+    const bmp=await createImageBitmap(file), sc=Math.min(1,1600/Math.max(bmp.width,bmp.height));
+    const c=document.createElement('canvas'); c.width=Math.round(bmp.width*sc); c.height=Math.round(bmp.height*sc);
+    const ctx=c.getContext('2d'); ctx.fillStyle='#fff'; ctx.fillRect(0,0,c.width,c.height); ctx.drawImage(bmp,0,0,c.width,c.height);
+    const blob=await new Promise(r=>c.toBlob(r,'image/jpeg',0.82));
+    if(!blob||blob.size>=file.size) return file;
+    return new File([blob],file.name.replace(/\.\w+$/,'')+'.jpg',{type:'image/jpeg'});
+  }catch(e){ return file; }
+}
+async function uploadFile(kind,ownerId,file){
+  file=await shrinkImage(file);
+  if(file.size>FILE_MAX){ const e=new Error(file.name+' is larger than 50 MB. Add it as a link instead (Google Drive or YouTube).'); e.custom=true; throw e; }
+  const safe=file.name.replace(/[^\w.\-]+/g,'_').slice(-80);
+  const path=myId()+'/'+kind+'/'+ownerId+'/'+Date.now().toString(36)+Math.random().toString(36).slice(2,6)+'-'+safe;
+  const up=await sb.storage.from('attachments').upload(path,file,{contentType:file.type||'application/octet-stream'});
+  if(up.error){ const e=new Error('Upload failed: '+up.error.message); e.custom=true; throw e; }
+  await dbw(sb.from('attachments').insert({owner_kind:kind,owner_id:String(ownerId),name:file.name,path,mime:file.type||'',size:file.size,uploaded_by:myId()}));
+}
+async function addLink(kind,ownerId,url,name){ await dbw(sb.from('attachments').insert({owner_kind:kind,owner_id:String(ownerId),name:name||url,url,mime:'link',size:0,uploaded_by:myId()})); }
+async function removeAtt(a){
+  if(a.path){ try{ await sb.storage.from('attachments').remove([a.path]); }catch(e){} }
+  await dbw(sb.from('attachments').delete().eq('id',a.id)); await reload();
+}
+async function safeUpload(picker,ownerId){ try{ await picker.upload(ownerId); }catch(e){ toast('Saved, but a file was not uploaded: '+(e.message||'error')+' Open it and add the file again.'); } }
+function attAdder(kind,id,label){
+  if(!S.canWrite) return null;
+  const input=h('input',{type:'file',multiple:'',hidden:''});
+  const busy=h('span',{class:'hint'});
+  input.addEventListener('change',async()=>{
+    const files=[...input.files]; if(!files.length) return; busy.textContent='Uploading…';
+    try{ for(const f of files) await uploadFile(kind,id,f); await reload(); toast(files.length+' file'+(files.length>1?'s':'')+' added'); }catch(e){ toast(writeErr(e)); }
+    busy.textContent=''; input.value='';
+  });
+  const lurl=h('input',{type:'text',placeholder:'https://… (video, Google Drive, document)','aria-label':'Link address'});
+  const lrow=h('div',{class:'gadd',hidden:''},lurl,h('button',{class:'btn small primary',type:'button',onclick:async()=>{
+    const u=lurl.value.trim(); if(!safeLink(u)){ toast('The link must start with https://'); return; }
+    try{ await addLink(kind,id,u); lurl.value=''; lrow.hidden=true; await reload(); toast('Link added'); }catch(e){ toast(writeErr(e)); }
+  }},'Save'));
+  return h('div',{},h('div',{class:'att-add'},h('button',{class:'btn small',type:'button',onclick:()=>input.click()},label||'Add files or videos'),h('button',{class:'btn small ghost',type:'button',onclick:()=>{ lrow.hidden=!lrow.hidden; }},'Add link'),busy,input),lrow);
+}
+function attBlock(kind,id,label){
+  const l=attList(kind,id), a=attAdder(kind,id,label);
+  if(!l && !a) return null;
+  return h('div',{class:'field'},h('label',{text:'Files, photos and videos'}),l,a);
+}
+function attPicker(kind,existingId){
+  const pending=[];
+  const exEl=h('div',{class:'atts'}), pendEl=h('div',{class:'pend'}), err=h('div',{class:'red hint'}), tip=h('div',{class:'hint'});
+  const paintEx=()=>{ const cur=existingId?attsFor(kind,existingId):[]; exEl.hidden=!cur.length; exEl.replaceChildren(...cur.map(a=>attItem(a,async x=>{ await removeAttUI(x); paintEx(); }))); if(cur.some(a=>a.path&&!urlOf(a))) ensureUrls(cur).then(paintEx); };
+  const paintPend=()=>pendEl.replaceChildren(...pending.map(p=>h('span',{class:'chip'},p.file?p.file.name+' ('+fmtSize(p.file.size)+')':'Link: '+p.link,h('button',{type:'button',class:'x','aria-label':'Remove',onclick:()=>{ pending.splice(pending.indexOf(p),1); paintPend(); }},'×'))));
+  const input=h('input',{type:'file',multiple:'',hidden:''});
+  input.addEventListener('change',()=>{ err.textContent=''; for(const f of input.files){ if(f.size>FILE_MAX){ err.textContent=f.name+' is larger than 50 MB. Add it as a link instead.'; continue; } if(f.type.startsWith('video/')&&f.size>20*1024*1024) tip.textContent='Tip: big videos use up your free storage. A YouTube or Google Drive link is better for long videos.'; pending.push({file:f}); } input.value=''; paintPend(); });
+  const lurl=h('input',{type:'text',placeholder:'https://… link to a video or document','aria-label':'Link address'});
+  const lrow=h('div',{class:'gadd',hidden:''},lurl,h('button',{class:'btn small',type:'button',onclick:()=>{ const u=lurl.value.trim(); if(!safeLink(u)){ err.textContent='The link must start with https://'; return; } err.textContent=''; pending.push({link:u}); lurl.value=''; lrow.hidden=true; paintPend(); }},'Add'));
+  paintEx();
+  const el=h('div',{class:'attpick'},exEl,pendEl,h('div',{class:'att-add'},h('button',{class:'btn small',type:'button',onclick:()=>input.click()},'Add files, photos or videos'),h('button',{class:'btn small ghost',type:'button',onclick:()=>{ lrow.hidden=!lrow.hidden; }},'Add link'),input),lrow,err,tip,h('div',{class:'hint',text:'Files up to 50 MB. Photos are shrunk automatically. For bigger videos, add a Google Drive or YouTube link.'}));
+  return {el,get:()=>pending,upload:async ownerId=>{ for(const p of [...pending]){ if(p.file) await uploadFile(kind,ownerId,p.file); else await addLink(kind,ownerId,p.link); pending.splice(pending.indexOf(p),1); } }};
+}
+
+/* ---------- Finance (Treasurer work area) ---------- */
+const FIN_CATS = ['Membership fees','Donations','Grants','Events','Training','Transport','Communication','Supplies','Printing','Other'];
+const currency = () => S.settings.currency || 'ETB';
+const money = n => new Intl.NumberFormat(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}).format(n||0);
+const moneyC = n => money(n)+' '+currency();
+const sumAmt = a => a.reduce((x,e)=>x+Number(e.amount||0),0);
+const finStats = list => { const inc=sumAmt(list.filter(e=>e.kind==='income')), exp=sumAmt(list.filter(e=>e.kind==='expense')); return {inc,exp,bal:inc-exp}; };
+const shortNum = n => Math.abs(n)>=1e6?(n/1e6).toFixed(1)+'M':Math.abs(n)>=1e3?Math.round(n/1e3)+'k':String(Math.round(n));
+function finMonths(n){ const out=[], d=new Date(); d.setDate(1); for(let i=n-1;i>=0;i--){ const x=new Date(d.getFullYear(),d.getMonth()-i,1); out.push({key:x.getFullYear()+'-'+pad(x.getMonth()+1),label:x.toLocaleDateString(undefined,{month:'short'})}); } return out; }
+
+function financeMonthChart(){
+  const ms=finMonths(6).map(m=>{ const l=S.fin.filter(e=>e.date.startsWith(m.key)); const s=finStats(l); return {label:m.label,inc:s.inc,exp:s.exp}; });
+  const top=Math.max(...ms.map(m=>Math.max(m.inc,m.exp)),1), p=Math.pow(10,Math.floor(Math.log10(top/4))), step=Math.ceil(top/4/p)*p, max=step*4;
+  const W=560,H=230,L=44,R=8,Tp=14,B=34,iw=W-L-R,ih=H-Tp-B,bw=iw/ms.length; let g='';
+  for(let k=0;k<=4;k++){ const y=Tp+ih-(ih*k/4); g+='<line x1="'+L+'" x2="'+(W-R)+'" y1="'+y+'" y2="'+y+'" stroke="var(--line)"/><text x="'+(L-6)+'" y="'+(y+4)+'" text-anchor="end">'+shortNum(step*k)+'</text>'; }
+  ms.forEach((m,i)=>{ const x=L+i*bw,w=bw*0.32,h1=ih*m.inc/max,h2=ih*m.exp/max,x1=x+bw*0.14,x2=x1+w+3;
+    g+='<rect x="'+x1+'" y="'+(Tp+ih-h1)+'" width="'+w+'" height="'+h1+'" rx="3" fill="var(--green)"/><rect x="'+x2+'" y="'+(Tp+ih-h2)+'" width="'+w+'" height="'+h2+'" rx="3" fill="var(--red)"/><text x="'+(x+bw/2)+'" y="'+(H-12)+'" text-anchor="middle">'+m.label+'</text>'; });
+  const box=h('div',{}); box.innerHTML='<svg class="chart" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Income and expenses for the last 6 months" style="width:100%;height:auto">'+g+'</svg>';
+  return h('div',{class:'panel acc-green'},h('div',{class:'ph'},h('h3',{text:'Income and expenses · last 6 months'})),box,
+    h('div',{class:'legend'},h('span',{},h('i',{class:'sw',style:'background:var(--green)'}),'Income'),h('span',{},h('i',{class:'sw',style:'background:var(--red)'}),'Expenses')));
+}
+function financeBudgets(){
+  const yr=String(new Date().getFullYear());
+  const spent=cat=>sumAmt(S.fin.filter(e=>e.kind==='expense'&&e.category===cat&&e.date.startsWith(yr)));
+  const rows=[...S.budgets].sort((a,b)=>a.category.localeCompare(b.category));
+  return h('div',{class:'panel acc-amber'},h('div',{class:'ph'},h('h3',{text:'Budget vs spent · '+yr}),S.canFinance?h('button',{class:'btn small sp',onclick:()=>budgetForm()},'+ Set budget'):null),
+    rows.length?rows.map(b=>{ const sp=spent(b.category), pct=b.amount?Math.round(sp/b.amount*100):0, over=sp>b.amount;
+      return h('div',{class:'bud'},h('div',{class:'bud-h'},h('b',{text:b.category}),h('span',{class:over?'red':'hint',text:moneyC(sp)+' of '+moneyC(b.amount)+' ('+pct+'%)'})),
+        h('div',{class:'bar'+(over?' over':'')},h('i',{style:'width:'+Math.min(100,pct)+'%'})),
+        h('div',{class:'hint',text:over?'Over budget by '+moneyC(sp-b.amount):'Remaining '+moneyC(b.amount-sp)}),
+        S.canFinance?h('div',{class:'rowline'},h('button',{class:'btn small ghost',onclick:()=>budgetForm(b)},'Edit'),confirmDel(()=>delRow('finance_budgets',b.id))):null); }):
+    h('p',{class:'empty',text:S.canFinance?'No budgets yet. Set a yearly budget per category to track spending.':'The treasurer has not set budgets yet.'}));
+}
+function financeCategories(){
+  const yr=String(new Date().getFullYear()), ex=S.fin.filter(e=>e.kind==='expense'&&e.date.startsWith(yr)), tot=sumAmt(ex)||1;
+  const cats=[...new Set(ex.map(e=>e.category))].map(c=>({c,v:sumAmt(ex.filter(e=>e.category===c))})).sort((a,b)=>b.v-a.v);
+  return h('div',{class:'panel acc-red'},h('div',{class:'ph'},h('h3',{text:'Where the money goes · '+yr})),
+    cats.length?cats.map(x=>h('div',{class:'pbar'},h('span',{class:'nm',style:'width:120px',text:x.c}),h('div',{class:'bar'},h('i',{style:'width:'+Math.round(x.v/tot*100)+'%;background:var(--red)'})),h('span',{class:'hint',style:'min-width:110px;text-align:right',text:moneyC(x.v)}))):h('p',{class:'empty',text:'No expenses recorded this year.'}));
+}
+function calcPanel(){
+  const rows=[{item:'',qty:1,unit:0}]; const list=h('div',{}), total=h('b',{style:'font-size:20px'}), per=h('span',{class:'hint'});
+  const people=h('input',{type:'number',min:'1',value:'1','aria-label':'Number of people',style:'width:90px'});
+  const recalc=()=>{ const t=rows.reduce((a,r)=>a+(Number(r.qty)||0)*(Number(r.unit)||0),0); total.textContent=moneyC(t); const n=Math.max(1,Number(people.value)||1); per.textContent=n>1?'Per person: '+moneyC(t/n):''; list.querySelectorAll('.sub').forEach((el,i)=>{ el.textContent=money((Number(rows[i].qty)||0)*(Number(rows[i].unit)||0)); }); calcTotal=t; };
+  let calcTotal=0;
+  const paint=()=>{ list.replaceChildren(...rows.map((r,i)=>h('div',{class:'calc-row'},
+    h('input',{type:'text',placeholder:'Item (e.g. Transport)',value:r.item,'aria-label':'Item',oninput:e=>{ r.item=e.target.value; }}),
+    h('input',{type:'number',min:'0',step:'any',value:r.qty,'aria-label':'Quantity',oninput:e=>{ r.qty=e.target.value; recalc(); }}),
+    h('input',{type:'number',min:'0',step:'any',value:r.unit,'aria-label':'Unit price',oninput:e=>{ r.unit=e.target.value; recalc(); }}),
+    h('span',{class:'sub',text:'0.00'}),
+    h('button',{class:'x-close',type:'button','aria-label':'Remove row',style:'font-size:18px',onclick:()=>{ rows.splice(i,1); if(!rows.length) rows.push({item:'',qty:1,unit:0}); paint(); }},'×')))); recalc(); };
+  people.addEventListener('input',recalc); paint();
+  return h('div',{class:'panel acc-purple'},h('div',{class:'ph'},h('h3',{text:'Quick budget calculator'})),
+    h('div',{class:'hint',style:'margin-bottom:6px',text:'Item · quantity · unit price · subtotal'}), list,
+    h('div',{class:'rowline',style:'margin:8px 0'},h('button',{class:'btn small',type:'button',onclick:()=>{ rows.push({item:'',qty:1,unit:0}); paint(); }},'+ Add row'),h('span',{class:'hint',text:'People:'}),people),
+    h('div',{class:'rowline',style:'justify-content:space-between'},h('div',{},'Total ',total,' ',per),
+      S.canFinance?h('button',{class:'btn small primary',type:'button',onclick:()=>entryForm('expense',null,{description:rows.filter(r=>r.item).map(r=>r.item).join(', '),amount:calcTotal})},'Record as expense'):null));
+}
+function financeView(view){
+  const F=S.finFilter, all=[...S.fin].sort((a,b)=>b.date.localeCompare(a.date)||String(b.id).localeCompare(String(a.id)));
+  const months=[...new Set(all.map(e=>e.date.slice(0,7)))].sort().reverse();
+  const q=(F.q||'').toLowerCase();
+  const list=all.filter(e=>(F.month==='all'||e.date.startsWith(F.month))&&(F.kind==='all'||e.kind===F.kind)&&(F.cat==='all'||e.category===F.cat)&&(!q||(e.description+' '+e.party+' '+e.category).toLowerCase().includes(q)));
+  const tot=finStats(all), sel=finStats(list), thisM=finStats(all.filter(e=>e.date.startsWith(finMonths(1)[0].key)));
+  const treasurers=activeMembers().filter(p=>p.position==='treasurer');
+  view.append(h('div',{class:'hero acc-green'},h('div',{},h('h2',{text:'Finance'}),h('p',{text:treasurers.length?'Treasurer: '+treasurers.map(p=>pn(p.id)).join(', ')+'. Everyone can view; the treasurer and admins record entries.':'No treasurer is set yet. An admin can choose one in the Team tab.'})),
+    h('div',{class:'sp'},S.canFinance?[h('button',{class:'btn primary',onclick:()=>entryForm('income')},'+ Income'),h('button',{class:'btn primary',onclick:()=>entryForm('expense')},'+ Expense'),h('button',{class:'btn',onclick:currencyForm},'Currency: '+currency())]:null,h('button',{class:'btn',onclick:exportFinanceCsv},'Export CSV'))));
+  view.append(h('div',{class:'stats'},
+    h('div',{class:'stat acc-blue'},h('b',{text:money(tot.bal)}),h('span',{text:'Balance ('+currency()+')'})),
+    h('div',{class:'stat acc-green'},h('b',{text:money(tot.inc)}),h('span',{text:'Total income'})),
+    h('div',{class:'stat acc-red'},h('b',{text:money(tot.exp)}),h('span',{text:'Total expenses'})),
+    h('div',{class:'stat acc-purple'},h('b',{text:(thisM.bal>=0?'+':'')+money(thisM.bal)}),h('span',{text:'Net this month'}))));
+  view.append(h('div',{class:'grid-eq'},financeMonthChart(),financeBudgets()));
+  view.append(h('div',{class:'grid-eq'},financeCategories(),calcPanel()));
+  const mSel=h('select',{'aria-label':'Month',onchange:e=>{F.month=e.target.value;render();}},h('option',{value:'all',text:'All months'}),...months.map(m=>h('option',{value:m,text:new Date(m+'-01T00:00:00').toLocaleDateString(undefined,{month:'long',year:'numeric'})}))); mSel.value=months.includes(F.month)?F.month:'all';
+  const kSel=h('select',{'aria-label':'Type',onchange:e=>{F.kind=e.target.value;render();}},h('option',{value:'all',text:'Income and expenses'}),h('option',{value:'income',text:'Income only'}),h('option',{value:'expense',text:'Expenses only'})); kSel.value=F.kind;
+  const cats=[...new Set([...FIN_CATS,...all.map(e=>e.category)])];
+  const cSel=h('select',{'aria-label':'Category',onchange:e=>{F.cat=e.target.value;render();}},h('option',{value:'all',text:'All categories'}),...cats.map(c=>h('option',{value:c,text:c}))); cSel.value=cats.includes(F.cat)?F.cat:'all';
+  const search=h('input',{type:'text',placeholder:'Search entries…','aria-label':'Search entries',value:F.q||''});
+  let qT=null; search.addEventListener('input',()=>{ F.q=search.value; clearTimeout(qT); qT=setTimeout(()=>{ render(); const n=document.querySelector('#view input[aria-label="Search entries"]'); if(n){ n.focus(); n.setSelectionRange(n.value.length,n.value.length); } },250); });
+  view.append(h('div',{class:'panel acc-blue'},h('div',{class:'ph'},h('h3',{text:'Ledger'}),h('span',{class:'hint sp',text:list.length+' entries · income '+money(sel.inc)+' · expenses '+money(sel.exp)+' · net '+money(sel.bal)+' '+currency()})),
+    h('div',{class:'filters'},search,mSel,kSel,cSel),
+    list.length?list.map(e=>{ const d=parseD(e.date);
+      return h('div',{class:'fin-row'},h('div',{class:'fin-d'},h('b',{text:d.getDate()}),h('span',{text:d.toLocaleDateString(undefined,{month:'short',year:'2-digit'})})),
+        h('div',{style:'flex:1;min-width:200px'},h('div',{class:'t',style:'font-weight:600',text:e.description||e.category}),
+          h('div',{class:'hint',text:e.category+(e.party?' · '+(e.kind==='income'?'From ':'To ')+e.party:'')}), attList('transaction',e.id), attAdder('transaction',e.id,'Add receipt')),
+        h('div',{style:'text-align:right'},h('div',{class:'money '+(e.kind==='income'?'inc':'exp'),text:(e.kind==='income'?'+':'−')+money(e.amount)+' '+currency()}),
+          S.canFinance?h('div',{class:'rowline',style:'justify-content:flex-end'},h('button',{class:'btn small ghost',onclick:()=>entryForm(e.kind,e)},'Edit'),confirmDel(()=>delRow('finance_entries',e.id))):null));
+    }):h('p',{class:'empty',text:all.length?'No entries match these filters.':(S.canFinance?'No entries yet. Add the first income or expense.':'No entries yet.')})));
+}
+function entryForm(kind,e,pre){
+  const ex=!!e; pre=pre||{};
+  const type=h('select',{},h('option',{value:'income',text:'Income (money in)'}),h('option',{value:'expense',text:'Expense (money out)'})); type.value=ex?e.kind:kind;
+  const date=h('input',{type:'date',value:ex?e.date:todayStr()});
+  const amount=h('input',{type:'number',min:'0',step:'0.01',value:ex?e.amount:(pre.amount?Math.round(pre.amount*100)/100:''),placeholder:'0.00'});
+  const cat=h('input',{type:'text',value:ex?e.category:(pre.category||''),list:'finCats',placeholder:'Choose or type a category'});
+  const dl=h('datalist',{id:'finCats'},...[...new Set([...FIN_CATS,...S.fin.map(x=>x.category)])].map(c=>h('option',{value:c})));
+  const desc=h('input',{type:'text',value:ex?e.description:(pre.description||''),placeholder:'What was it for?'});
+  const party=h('input',{type:'text',value:ex?e.party:'',placeholder:'Who paid or who was paid'});
+  const files=attPicker('transaction',ex?e.id:null);
+  openForm(ex?'Edit entry':'New entry',[h('div',{class:'two'},field('Type',type),field('Date',date)),h('div',{class:'two'},field('Amount ('+currency()+')',amount),field('Category',[cat,dl])),field('Description',desc),field('From / to',party),field('Receipts, photos or files',files.el)],async()=>{
+    const amt=Number(amount.value);
+    if(!(amt>0)){ toast('Enter an amount greater than zero.'); return false; }
+    if(!cat.value.trim()||!date.value){ toast('Add a category and date.'); return false; }
+    const data={entry_date:date.value,kind:type.value,category:cat.value.trim(),description:desc.value.trim(),party:party.value.trim(),amount:amt};
+    if(ex){ await dbw(sb.from('finance_entries').update(data).eq('id',e.id)); await safeUpload(files,e.id); }
+    else { const res=await dbw(sb.from('finance_entries').insert({...data,created_by:myId()}).select('id').single()); await safeUpload(files,res.id); }
+    toast('Entry saved'); reload();
+  },ex?'Save changes':'Save entry');
+}
+function budgetForm(b){
+  const ex=!!b;
+  const cat=h('input',{type:'text',value:ex?b.category:'',list:'finCats2',placeholder:'Category',disabled:ex?'':null});
+  const dl=h('datalist',{id:'finCats2'},...FIN_CATS.map(c=>h('option',{value:c})));
+  const amount=h('input',{type:'number',min:'0',step:'0.01',value:ex?b.amount:'',placeholder:'Yearly budget'});
+  openForm(ex?'Edit budget':'Set budget',[field('Category',[cat,dl]),field('Yearly budget ('+currency()+')',amount,'Spending in this category this year is compared with this amount.')],async()=>{
+    const amt=Number(amount.value); if(!cat.value.trim()||!(amt>0)){ toast('Add a category and an amount greater than zero.'); return false; }
+    await dbw(sb.from('finance_budgets').upsert({category:cat.value.trim(),amount:amt},{onConflict:'category'})); reload(); toast('Budget saved');
+  });
+}
+function currencyForm(){
+  const c=h('input',{type:'text',value:currency(),maxlength:'6',placeholder:'ETB, USD, EUR…'});
+  openForm('Currency',[field('Currency code',c,'Shown next to every amount. Existing amounts are not converted.')],async()=>{
+    const v=c.value.trim().toUpperCase(); if(!v){ toast('Enter a currency code.'); return false; }
+    await dbw(sb.from('app_settings').upsert({key:'currency',value:v},{onConflict:'key'})); reload();
+  });
+}
+function exportFinanceCsv(){
+  const q=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
+  const rows=[['Date','Type','Category','Description','From/To','Amount','Currency']];
+  [...S.fin].sort((a,b)=>a.date.localeCompare(b.date)).forEach(e=>rows.push([e.date,e.kind,e.category,e.description,e.party,e.amount.toFixed(2),currency()]));
+  const blob=new Blob(['\ufeff'+rows.map(r=>r.map(q).join(',')).join('\n')],{type:'text/csv'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='finance-'+todayStr()+'.csv'; document.body.append(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+
+/* ---------- Positions and work areas ---------- */
+const POSITIONS = {chair:'Chair person',vice_chair:'Vice chair person',secretary:'Secretary general',advocacy:'Advocacy',communication:'Communication',treasurer:'Treasurer',coordinator:'Project coordinator'};
+const posLabel = p => POSITIONS[p]||'';
+const KIND_TAG = {meeting:['Meeting','todo'],event:['Event','done'],training:['Training','progress']};
+const AREAS = [
+  {key:'leadership',label:'Leadership',acc:'blue',pos:['chair','vice_chair'],team:'Leadership',blurb:'Oversight for the chair person and vice chair person: team health, plans and decisions.'},
+  {key:'secretariat',label:'Secretariat',acc:'amber',pos:['secretary'],team:'Secretariat',blurb:'Records, meetings and minutes kept by the secretary general.'},
+  {key:'advocacy',label:'Advocacy',acc:'purple',pos:['advocacy'],team:'Advocacy',blurb:'Campaigns, partners and policy work.'},
+  {key:'projects',label:'Projects',acc:'teal',pos:['coordinator'],team:'Projects',blurb:'Coordinate projects and workstreams across the team.'}];
+const posArea = {chair:'leadership',vice_chair:'leadership',secretary:'secretariat',advocacy:'advocacy',communication:'media',treasurer:'finance',coordinator:'projects'};
+const AREA_META = {leadership:['Leadership','blue'],secretariat:['Secretariat','amber'],advocacy:['Advocacy','purple'],media:['Media','pink'],finance:['Finance','green'],projects:['Projects','teal'],training:['Training','orange']};
+const holdersOf = positions => activeMembers().filter(p=>positions.includes(p.position));
+function myAreaChips(){
+  const keys=[]; if(S.pos&&posArea[S.pos]) keys.push(posArea[S.pos]); if(S.isTrainer&&!keys.includes('training')) keys.push('training');
+  if(!keys.length) return null;
+  return h('div',{class:'panel sec'},h('div',{class:'ph'},h('h3',{text:'Your work area'+(keys.length>1?'s':'')}),S.pos?h('span',{class:'hint sp',text:'You are: '+posLabel(S.pos)}):null),
+    h('div',{class:'chipset'},keys.map(k=>h('button',{class:'areachip acc-'+AREA_META[k][1],onclick:()=>go(k)},icon(k),AREA_META[k][0]))));
+}
+function areaHero(label,acc,blurb,holders,buttons){
+  return h('div',{class:'hero acc-'+acc},h('div',{},h('h2',{text:label}),h('p',{text:blurb}),holders.length?h('div',{class:'chipset'},holders.map(p=>h('span',{class:'chip'},avatar(p.id,20),pn(p.id)+' · '+posLabel(p.position)))):h('p',{class:'hint',text:'No one is assigned yet. An admin can assign people in the Team tab.'})),h('div',{class:'sp'},buttons));
+}
+function areaPostCard(p,acc){
+  const mine=p.createdBy===myId(), can=S.canWrite;
+  const long=(p.body||'').length>400;
+  const body=p.body?(long?h('details',{},h('summary',{class:'hint',style:'cursor:pointer',text:trunc(p.body,200)}),h('p',{class:'body',text:p.body})):h('p',{class:'body',text:p.body})):null;
+  return h('div',{class:'postcard acc-'+acc},h('div',{class:'rowline'},h('span',{class:'tag todo',text:p.kind}),h('span',{class:'hint',text:nm(p.createdBy)+' · '+ago(p.createdAt)})),
+    h('h4',{text:p.title}),body,attList('area',p.id),attAdder('area',p.id,'Add file or video'),
+    can?h('div',{class:'rowline'},h('button',{class:'btn small ghost',onclick:()=>areaPostForm(p.area,p)},'Edit'),(mine||S.isAdmin)?confirmDel(()=>delRow('area_posts',p.id)):null):null);
+}
+function areaPostForm(area,p){
+  const ex=!!p, meta=AREA_META[area];
+  const kind=h('select',{},...['Plan','Report','Draft','Note','Decision'].map(k=>h('option',{value:k,text:k}))); kind.value=ex?p.kind:'Plan';
+  const title=h('input',{type:'text',value:ex?p.title:'',placeholder:'e.g. School outreach plan'});
+  const body=h('textarea',{rows:6,placeholder:'Write the details here'}); body.value=ex?(p.body||''):'';
+  const files=attPicker('area',ex?p.id:null);
+  openForm(ex?'Edit post':'New post · '+meta[0],[h('div',{class:'two'},field('Type',kind),field('Title',title)),field('Details',body),field('Files, photos and videos',files.el)],async()=>{
+    if(!title.value.trim()){ toast('Add a title.'); return false; }
+    const data={kind:kind.value,title:title.value.trim(),body:body.value.trim(),updated_at:new Date().toISOString()};
+    if(ex){ await dbw(sb.from('area_posts').update(data).eq('id',p.id)); await safeUpload(files,p.id); }
+    else { const res=await dbw(sb.from('area_posts').insert({...data,area,created_by:myId()}).select('id').single()); await safeUpload(files,res.id); }
+    toast('Saved'); reload();
+  },ex?'Save changes':'Post');
+}
+function areaTasks(A,holders){
+  const ids=holders.map(p=>p.id), tm=(A.team||'').toLowerCase();
+  return S.tasks.filter(t=>(t.team||'').toLowerCase()===tm||(t.ownerId&&ids.includes(t.ownerId))).sort((a,b)=>(a.status==='done')-(b.status==='done')||byDue(a,b));
+}
+function areaView(view,key){
+  const A=AREAS.find(x=>x.key===key), holders=holdersOf(A.pos);
+  view.append(areaHero(A.label,A.acc,A.blurb,holders,[S.canWrite?h('button',{class:'btn primary',onclick:()=>taskForm(null,'',A.team)},'+ New task'):null,S.canWrite?h('button',{class:'btn',onclick:()=>areaPostForm(key)},'+ New post'):null]));
+  if(key==='leadership') leadershipExtras(view);
+  if(key==='secretariat') secretariatExtras(view);
+  if(key==='projects') projectsExtras(view);
+  const ts=areaTasks(A,holders);
+  view.append(h('div',{class:'panel sec acc-'+A.acc},h('div',{class:'ph'},h('h3',{text:'Tasks for '+A.label})),ts.length?ts.slice(0,12).map(taskRow):h('p',{class:'empty',text:'No tasks yet. Tasks with the team name “'+A.team+'” or owned by the people above show here.'})));
+  const ps=S.areaPosts.filter(p=>p.area===key).sort((a,b)=>b.createdAt-a.createdAt);
+  view.append(h('div',{class:'panel acc-'+A.acc},h('div',{class:'ph'},h('h3',{text:'Plans, reports and files'})),ps.length?ps.map(p=>areaPostCard(p,A.acc)):h('p',{class:'empty',text:'Nothing posted yet. Add plans, reports, photos or videos with “+ New post”. Every member can add and edit files here.'})));
+}
+function leadershipExtras(view){
+  const roster=Object.entries(POSITIONS).map(([k,l])=>{ const hs=activeMembers().filter(p=>p.position===k); return h('div',{class:'rost'+(hs.length?'':' empty-pos')},h('small',{text:l}),hs.length?hs.map(p=>h('div',{class:'rowline'},avatar(p.id,24),h('b',{text:pn(p.id)}))):h('span',{class:'hint',text:'Not assigned'})); });
+  view.append(h('div',{class:'panel sec acc-blue'},h('div',{class:'ph'},h('h3',{text:'The committee'}),S.isAdmin?h('button',{class:'btn small ghost sp',onclick:()=>go('team')},'Assign positions'):null),h('div',{class:'roster'},roster)));
+  const wk=weekISO(), rows=activeMembers().map(p=>{ const mt=S.tasks.filter(t=>t.ownerId===p.id), od=mt.filter(isOver).length, op=mt.filter(t=>t.status!=='done').length, gs=S.goals.filter(g=>g.userId===p.id&&g.week===wk);
+    return h('tr',{},h('td',{},who(p.id,24)),h('td',{text:posLabel(p.position)||'Member'}),h('td',{text:op}),h('td',{},od?h('span',{class:'tag over',text:od}):'0'),h('td',{text:gs.length?gs.filter(g=>g.done).length+'/'+gs.length:'None set'})); });
+  const pend=Object.values(S.profiles).filter(p=>!p.active).length;
+  view.append(h('div',{class:'panel sec acc-red'},h('div',{class:'ph'},h('h3',{text:'Team health this week'}),pend&&S.isAdmin?h('button',{class:'btn small sp',onclick:()=>go('team')},pend+' waiting for approval'):null),
+    h('div',{class:'tbl-wrap'},h('table',{},h('thead',{},h('tr',{},h('th',{text:'Person'}),h('th',{text:'Position'}),h('th',{text:'Open tasks'}),h('th',{text:'Overdue'}),h('th',{text:'Weekly goals done'}))),h('tbody',{},rows)))));
+}
+function secretariatExtras(view){
+  const today=todayStr();
+  const miss=S.meetings.filter(m=>m.kind!=='training'&&m.date<today&&!S.minutes.some(x=>x.meetingId===m.id||(x.date===m.date&&x.title.toLowerCase().includes(m.title.toLowerCase().slice(0,12))))).sort((a,b)=>b.date.localeCompare(a.date)).slice(0,6);
+  view.append(h('div',{class:'panel sec acc-red'},h('div',{class:'ph'},h('h3',{text:'Meetings waiting for minutes'})),
+    miss.length?miss.map(m=>h('div',{class:'row'},h('div',{class:'grow'},h('div',{class:'t',text:m.title}),h('div',{class:'s',text:dLong(m.date)})),S.canMinutes?h('button',{class:'btn small primary',onclick:()=>minutesForm(null,m)},'Post minutes'):null)):h('p',{class:'empty',text:'All past meetings have minutes. Well done.'})));
+  const latest=[...S.minutes].sort((a,b)=>(b.date||'').localeCompare(a.date||'')).slice(0,2);
+  view.append(h('div',{class:'panel sec acc-amber'},h('div',{class:'ph'},h('h3',{text:'Latest minutes'}),h('button',{class:'btn small ghost sp',onclick:()=>go('meetings')},'All minutes')),latest.length?latest.map(x=>minuteCard(x,true)):h('p',{class:'empty',text:'No minutes posted yet.'})));
+}
+function projectsExtras(view){
+  const groups={}; S.tasks.forEach(t=>{ const k=(t.team||'').trim()||'No team'; (groups[k]=groups[k]||[]).push(t); });
+  const rows=Object.entries(groups).map(([k,ts])=>{ const d=ts.filter(t=>t.status==='done').length, od=ts.filter(isOver).length, avg=Math.round(ts.reduce((a,t)=>a+(t.status==='done'?100:(t.progress||0)),0)/ts.length);
+    return h('tr',{},h('td',{},h('b',{text:k})),h('td',{text:ts.length}),h('td',{text:d}),h('td',{},od?h('span',{class:'tag over',text:od}):'0'),h('td',{style:'min-width:160px'},h('div',{class:'rowline'},h('div',{class:'bar',style:'flex:1'},h('i',{style:'width:'+avg+'%'})),h('span',{class:'hint',text:avg+'%'})))); });
+  view.append(h('div',{class:'panel sec acc-teal'},h('div',{class:'ph'},h('h3',{text:'Workstream progress'})),rows.length?h('div',{class:'tbl-wrap'},h('table',{},h('thead',{},h('tr',{},h('th',{text:'Workstream'}),h('th',{text:'Tasks'}),h('th',{text:'Done'}),h('th',{text:'Overdue'}),h('th',{text:'Progress'}))),h('tbody',{},rows))):h('p',{class:'empty',text:'Give tasks a team or workstream name to see progress here.'})));
+}
+
+/* ---------- Training ---------- */
+const DOC_CATS = ['Manual','Slides','Handout','Video','Report','Other'];
+function trainingView(view){
+  const today=todayStr(), tr=S.meetings.filter(m=>m.kind==='training');
+  const up=tr.filter(m=>m.date>=today).sort(cmpMeet), past=tr.filter(m=>m.date<today).sort((a,b)=>cmpMeet(b,a));
+  const trainers=activeMembers().filter(p=>p.isTraining);
+  view.append(h('div',{class:'hero acc-orange'},h('div',{},h('h2',{text:'Training'}),h('p',{text:'Schedule, past sessions and the library of training documents. Every member can add materials.'}),
+    trainers.length?h('div',{class:'chipset'},trainers.map(p=>h('span',{class:'chip'},avatar(p.id,20),pn(p.id)+' · Trainer'))):h('p',{class:'hint',text:'No trainer is set yet. An admin can choose one in the Team tab.'})),
+    h('div',{class:'sp'},S.canTrain?h('button',{class:'btn primary',onclick:()=>meetingForm(null,'training')},'+ Schedule training'):null,S.canWrite?h('button',{class:'btn',onclick:()=>docForm()},'+ Add document'):null)));
+  view.append(h('div',{class:'panel sec acc-orange'},h('div',{class:'ph'},h('h3',{text:'Training schedule'})),up.length?up.map(m=>meetingCard(m,false)):h('p',{class:'empty',text:'No training sessions scheduled yet.'})));
+  view.append(h('div',{class:'panel sec acc-amber'},h('div',{class:'ph'},h('h3',{text:'Past trainings'})),past.length?past.slice(0,8).map(m=>{ const going=S.rsvps.filter(r=>r.meetingId===m.id&&r.response==='going').length;
+    return h('div',{class:'row',style:'align-items:flex-start'},h('div',{class:'grow'},h('div',{class:'t',text:m.title}),h('div',{class:'s',text:dLong(m.date)+(m.hostId?' · Led by '+pn(m.hostId):'')+(going?' · '+going+' joined':'')}),m.agenda?h('div',{class:'s',text:trunc(m.agenda,160)}):null,attList('meeting',m.id),attAdder('meeting',m.id,'Add materials')),
+      (S.canTrain)?h('button',{class:'btn small ghost',onclick:()=>meetingForm(m)},'Edit'):null); }):h('p',{class:'empty',text:'Past training sessions will appear here with their materials.'})));
+  const docs=[...S.trainDocs].sort((a,b)=>(b.date||'').localeCompare(a.date||'')), catF=S.docCat;
+  const cs=h('select',{'aria-label':'Document type',onchange:e=>{S.docCat=e.target.value;render();}},h('option',{value:'all',text:'All types'}),...DOC_CATS.map(c=>h('option',{value:c,text:c}))); cs.value=catF;
+  const shown=docs.filter(d=>catF==='all'||d.category===catF);
+  view.append(h('div',{class:'panel acc-orange'},h('div',{class:'ph'},h('h3',{text:'Training documents'}),h('div',{class:'sp'},cs)),
+    shown.length?shown.map(d=>h('div',{class:'postcard acc-orange'},h('div',{class:'rowline'},h('span',{class:'tag progress',text:d.category}),h('span',{class:'hint',text:(d.date?dLong(d.date)+' · ':'')+'added by '+nm(d.createdBy)})),
+      h('h4',{text:d.title}),d.description?h('p',{class:'body',text:d.description}):null,attList('training_doc',d.id),attAdder('training_doc',d.id,'Add file or video'),
+      S.canWrite?h('div',{class:'rowline'},h('button',{class:'btn small ghost',onclick:()=>docForm(d)},'Edit'),(d.createdBy===myId()||S.canTrain||S.isAdmin)?confirmDel(()=>delRow('training_docs',d.id)):null):null)):h('p',{class:'empty',text:'No documents yet. Add manuals, slides, handouts and recordings from past trainings.'})));
+}
+function docForm(d){
+  const ex=!!d;
+  const title=h('input',{type:'text',value:ex?d.title:'',placeholder:'e.g. Water sampling manual'});
+  const cat=h('select',{},...DOC_CATS.map(c=>h('option',{value:c,text:c}))); cat.value=ex?d.category:'Manual';
+  const date=h('input',{type:'date',value:ex?(d.date||''):todayStr()});
+  const desc=h('textarea',{rows:4,placeholder:'What is this document about?'}); desc.value=ex?(d.description||''):'';
+  const files=attPicker('training_doc',ex?d.id:null);
+  openForm(ex?'Edit document':'Add training document',[field('Title',title),h('div',{class:'two'},field('Type',cat),field('Date of training',date)),field('Description',desc),field('Files, slides and videos',files.el)],async()=>{
+    if(!title.value.trim()){ toast('Add a title.'); return false; }
+    const data={title:title.value.trim(),category:cat.value,doc_date:date.value||null,description:desc.value.trim()};
+    if(ex){ await dbw(sb.from('training_docs').update(data).eq('id',d.id)); await safeUpload(files,d.id); }
+    else { const res=await dbw(sb.from('training_docs').insert({...data,created_by:myId()}).select('id').single()); await safeUpload(files,res.id); }
+    toast('Saved'); reload();
+  },ex?'Save changes':'Add document');
+}
+
+/* ---------- shared helpers for the newer sections ---------- */
+const go = k => { S.view=k; render(); window.scrollTo(0,0); };
+const trunc = (s,n) => (s||'').length>n ? s.slice(0,n-1)+'…' : (s||'');
+const safeLink = l => /^https?:\/\//i.test(l||'');
+const activeMembers = () => Object.values(S.profiles).filter(p=>p.active);
+const cmpMeet = (a,b) => (a.date+(a.time||'')).localeCompare(b.date+(b.time||''));
+function weekStart(d){ const x=new Date(d); x.setDate(x.getDate()-((x.getDay()+6)%7)); x.setHours(0,0,0,0); return x; }
+const weekISO = (d=new Date()) => iso(weekStart(d));
+function weekLabel(ws){ const a=parseD(ws), b=new Date(a); b.setDate(b.getDate()+6); const f=x=>x.toLocaleDateString(undefined,{day:'numeric',month:'short'}); return f(a)+' – '+f(b); }
+const seenKey = () => 'nyn-seen-'+(myId()||'');
+function getSeen(){ try{ return Number(localStorage.getItem(seenKey()))||0; }catch(e){ return 0; } }
+function setSeen(v){ try{ localStorage.setItem(seenKey(),String(v)); }catch(e){} }
+function updText(u){
+  if(u.kind==='mention'){ let ids=[]; try{ ids=JSON.parse(u.text); }catch(e){} return 'Mentioned '+(ids.map(pn).join(', ')||'someone'); }
+  return u.text==='(attachment)'?'Added an attachment':u.text;
+}
+const PLATFORMS = ['Facebook','Instagram','X (Twitter)','LinkedIn','TikTok','YouTube','Telegram','Website / blog','Other'];
+
+/* ---------- Main board ---------- */
+function mainView(view, overdue){
+  const T=S.tasks, me=myId(), today=todayStr();
+  const avg=T.length?Math.round(T.reduce((a,t)=>a+(t.status==='done'?100:(t.progress||0)),0)/T.length):0;
+  const wk=Date.now()-7*864e5, doneWk=T.filter(t=>t.completedAt&&t.completedAt>=wk).length;
+  const first=(S.me&&S.me.name)?S.me.name.split(' ')[0]:'';
+  view.append(
+    h('div',{class:'page-head'},h('div',{},h('h2',{text:greeting()+(first?', '+first:'')}),h('p',{text:'Main board · '+dLong(today)}))),
+    h('div',{class:'stats'},
+      h('div',{class:'stat acc-blue'},h('b',{text:avg+'%'}),h('span',{text:'Overall progress'}),h('div',{class:'bar',style:'margin-top:8px'},h('i',{style:'width:'+avg+'%'}))),
+      h('div',{class:'stat acc-purple'},h('b',{text:T.filter(t=>t.status!=='done').length}),h('span',{text:'Open tasks'})),
+      h('div',{class:'stat s-red acc-red'},h('b',{},overdue.length?h('span',{class:'pulse-dot',style:'margin-right:8px'}):null,overdue.length),h('span',{text:'Overdue'})),
+      h('div',{class:'stat s-green acc-green'},h('b',{text:doneWk}),h('span',{text:'Completed this week'}))));
+
+  { const mine_=myAreaChips(); if(mine_) view.append(mine_); }
+  // 1. upcoming meetings and events
+  const up=S.meetings.filter(m=>m.date>=today).sort(cmpMeet).slice(0,3);
+  view.append(h('div',{class:'panel sec acc-blue'},
+    h('div',{class:'ph'},h('h3',{text:'Upcoming meetings & events'}),h('button',{class:'btn small ghost sp',onclick:()=>go('meetings')},'See all')),
+    up.length?up.map(m=>meetingCard(m,true)):h('p',{class:'empty',text:'No meetings or events scheduled yet.'})));
+
+  // 2. team tasks by priority  |  latest changes
+  const W={high:0,med:1,low:2};
+  let open=T.filter(t=>t.status!=='done'); if(S.prioMine&&me) open=open.filter(t=>t.ownerId===me);
+  open.sort((a,b)=>(W[a.priority||'med']-W[b.priority||'med'])||byDue(a,b));
+  const seg=h('div',{class:'seg small sp',role:'group','aria-label':'Show'},...[['All',false],['Mine',true]].map(([l,v])=>h('button',{type:'button','aria-pressed':S.prioMine===v?'true':'false',onclick:()=>{S.prioMine=v;render();}},l)));
+  view.append(h('div',{class:'grid-eq'},
+    h('div',{class:'panel acc-purple'},h('div',{class:'ph'},h('h3',{text:'Team tasks by priority'}),seg),
+      open.length?[open.slice(0,10).map(priorityRow),open.length>10?h('p',{class:'hint',text:'Showing 10 of '+open.length+' open tasks.'}):null]:h('p',{class:'empty',text:'No open tasks.'})),
+    changesPanel(overdue)));
+
+  // 3. completion graph  |  media
+  const posts=S.posts.filter(p=>p.status!=='published').sort((a,b)=>a.postDate.localeCompare(b.postDate)).slice(0,3);
+  view.append(h('div',{class:'grid-eq'},chartPanel(),
+    h('div',{class:'panel acc-pink'},h('div',{class:'ph'},h('h3',{text:'Media: coming posts'}),h('button',{class:'btn small ghost sp',onclick:()=>go('media')},'Open media')),
+      posts.length?posts.map(p=>mediaCard(p,true)):h('p',{class:'empty',text:'No posts waiting. The communication lead adds upcoming posts here for the team to confirm.'}))));
+
+  // 4. weekly goals
+  view.append(goalsMini());
+}
+function priorityRow(t){
+  const over=isOver(t);
+  return h('div',{class:'row clickable',onclick:()=>openTask(t.id)},
+    h('span',{class:'prio p-'+(t.priority||'med'),text:PRIO[t.priority||'med']}),
+    h('div',{class:'grow'},h('div',{class:'t',text:t.title}),h('div',{class:'s'},t.ownerId?pn(t.ownerId)+' · ':'',t.team?t.team+' · ':'',h('span',{class:over?'red':'',text:dueLabel(t)}))),
+    over?h('span',{class:'pulse-dot',title:'Overdue'}):null,
+    h('div',{style:'width:60px'},h('div',{class:'bar'},h('i',{style:'width:'+(t.progress||0)+'%'}))));
+}
+
+/* ---------- Latest changes ---------- */
+function buildFeed(){
+  const items=[];
+  S.tasks.forEach(t=>{
+    (t.updates||[]).forEach(u=>{
+      let type='update', ids=null;
+      if(u.kind==='mention'){ type='mention'; try{ ids=JSON.parse(u.text); }catch(e){ ids=[]; } }
+      else if(u.kind==='status') type=/changed to Done$/.test(u.text||'')?'done':'status';
+      items.push({at:u.at,type,by:u.by,t,text:u.text,ids});
+    });
+    if(t.createdAt) items.push({at:t.createdAt,type:'new',by:t.createdBy,t});
+  });
+  S.meetings.forEach(m=>{ if(m.createdAt) items.push({at:m.createdAt,type:'meeting',by:m.createdBy,m}); });
+  S.posts.forEach(p=>{ if(p.createdAt) items.push({at:p.createdAt,type:'post',by:p.createdBy,p}); });
+  return items.filter(i=>i.at).sort((a,b)=>b.at-a.at);
+}
+function feedRow(f,seen){
+  const me=myId(); let dot='upd', text=[], click=()=>{ if(f.t) openTask(f.t.id); };
+  const who_=h('b',{text:f.by?nm(f.by):'Someone'}), tl=f.t?h('b',{text:f.t.title}):null;
+  if(f.type==='done'){ dot='done'; text=[who_,' completed ',tl]; }
+  else if(f.type==='mention'){ const ids=f.ids||[]; dot='men'; text=[who_,' mentioned ',ids.includes(me)?h('b',{class:'you',text:'you'}):(ids.map(pn).join(', ')||'someone'),' on ',tl]; }
+  else if(f.type==='status') text=[who_,' · ',tl,': ',f.text];
+  else if(f.type==='update') text=[who_,' updated ',tl,': ',trunc(f.text,90)];
+  else if(f.type==='new'){ dot='new'; text=[who_,' created ',tl]; }
+  else if(f.type==='meeting'){ dot='men'; click=()=>go('meetings'); text=[who_,' scheduled ',h('b',{text:f.m.title})]; }
+  else if(f.type==='post'){ dot='men'; click=()=>go('media'); text=[who_,' added a media post ',h('b',{text:f.p.title})]; }
+  return h('div',{class:'feed clickable',onclick:click},h('span',{class:'fdot '+dot}),
+    h('div',{class:'grow'},h('div',{},text,f.at>seen?h('span',{class:'newtag',text:'new'}):null),h('div',{class:'s',text:ago(f.at)})));
+}
+function changesPanel(overdue){
+  const seen=getSeen(), feed=buildFeed().slice(0,12), box=h('div',{class:'panel acc-amber'});
+  box.append(h('div',{class:'ph'},h('h3',{text:'Latest changes'}),h('button',{class:'btn small ghost sp',onclick:()=>{ setSeen(Date.now()); render(); }},'Mark all seen')));
+  if(overdue.length){
+    const list=[...overdue].sort(byDue);
+    box.append(h('div',{class:'alert-box'},
+      h('div',{class:'ab-h'},h('span',{class:'pulse-dot'}),overdue.length+' overdue task'+(overdue.length>1?'s':'')),
+      ...list.slice(0,4).map(t=>h('div',{class:'ab-row'},
+        h('div',{class:'clickable',style:'flex:1;min-width:0',onclick:()=>openTask(t.id)},h('b',{text:t.title}),h('div',{class:'s red',text:(t.ownerId?pn(t.ownerId)+' · ':'')+dueLabel(t)})),
+        h('button',{class:'btn small danger',onclick:()=>openShare(shareForTask(t,'over'))},'Alert team'))),
+      list.length>4?h('div',{class:'s',text:'+ '+(list.length-4)+' more overdue'}):null));
+  }
+  box.append(...(feed.length?feed.map(f=>feedRow(f,seen)):[h('p',{class:'empty',text:'Updates, completed tasks and mentions will show here.'})]));
+  return box;
+}
+
+/* ---------- Task completion graph ---------- */
+function chartPanel(){
+  const T=S.tasks, weeks=8, start=weekStart(new Date()), data=[];
+  for(let i=weeks-1;i>=0;i--){
+    const a=new Date(start); a.setDate(a.getDate()-7*i); const b=new Date(a); b.setDate(b.getDate()+7);
+    const f=a.getTime(), e=b.getTime();
+    data.push({label:a.toLocaleDateString(undefined,{day:'numeric',month:'short'}),
+      created:T.filter(t=>t.createdAt&&t.createdAt>=f&&t.createdAt<e).length,
+      completed:T.filter(t=>t.completedAt&&t.completedAt>=f&&t.completedAt<e).length});
+  }
+  const max=Math.ceil(Math.max(4,...data.map(d=>Math.max(d.created,d.completed)))/4)*4;
+  const W=560,H=230,L=34,R=8,Tp=14,B=34,iw=W-L-R,ih=H-Tp-B,bw=iw/weeks;
+  let g='';
+  for(let k=0;k<=4;k++){ const v=Math.round(max*k/4), y=Tp+ih-(ih*k/4); g+='<line x1="'+L+'" x2="'+(W-R)+'" y1="'+y+'" y2="'+y+'" stroke="var(--line)"/><text x="'+(L-6)+'" y="'+(y+4)+'" text-anchor="end">'+v+'</text>'; }
+  data.forEach((d,i)=>{
+    const x=L+i*bw, w=bw*0.32, h1=ih*d.created/max, h2=ih*d.completed/max, x1=x+bw*0.14, x2=x1+w+3;
+    g+='<rect x="'+x1+'" y="'+(Tp+ih-h1)+'" width="'+w+'" height="'+h1+'" rx="3" fill="var(--blue)" opacity=".45"/>';
+    g+='<rect x="'+x2+'" y="'+(Tp+ih-h2)+'" width="'+w+'" height="'+h2+'" rx="3" fill="var(--green)"/>';
+    g+='<text x="'+(x+bw/2)+'" y="'+(H-12)+'" text-anchor="middle">'+d.label+'</text>';
+    if(d.completed) g+='<text x="'+(x2+w/2)+'" y="'+(Tp+ih-h2-4)+'" text-anchor="middle" style="fill:var(--green);font-weight:600">'+d.completed+'</text>';
+  });
+  const totalDone=data.reduce((a,d)=>a+d.completed,0);
+  const svg=h('div',{});
+  svg.innerHTML='<svg class="chart" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Tasks created and completed per week over the last 8 weeks; '+totalDone+' completed" style="width:100%;height:auto">'+g+'</svg>';
+  const done=T.filter(t=>t.status==='done').length, rate=T.length?Math.round(done/T.length*100):0;
+  const people=[...new Set(T.map(t=>t.ownerId).filter(Boolean))].map(id=>{ const mt=T.filter(t=>t.ownerId===id); return {id,n:mt.length,d:mt.filter(t=>t.status==='done').length}; }).sort((a,b)=>b.d-a.d||b.n-a.n).slice(0,6);
+  return h('div',{class:'panel acc-teal'},
+    h('div',{class:'ph'},h('h3',{text:'Task completion'}),h('span',{class:'hint sp',text:rate+'% of all tasks done'})),
+    T.length?[svg,h('div',{class:'legend'},h('span',{},h('i',{class:'sw',style:'background:var(--blue);opacity:.45'}),'Created'),h('span',{},h('i',{class:'sw',style:'background:var(--green)'}),'Completed')),
+      people.length?h('div',{},h('h5',{style:'margin:6px 0;color:var(--muted)',text:'Completed by person'}),...people.map(p=>h('div',{class:'pbar'},h('span',{class:'nm',text:pn(p.id)}),h('div',{class:'bar'},h('i',{style:'width:'+Math.round(p.d/p.n*100)+'%'})),h('span',{class:'hint',text:p.d+'/'+p.n})))):null]:
+    h('p',{class:'empty',text:'The graph appears once tasks are created and completed.'}));
+}
+
+/* ---------- Weekly goals ---------- */
+function goalAdder(week){
+  const inp=h('input',{type:'text',placeholder:'Add a goal for this week…','aria-label':'New weekly goal',maxlength:'200'});
+  const add=async()=>{ const v=inp.value.trim(); if(!v) return; inp.value=''; try{ await dbw(sb.from('weekly_goals').insert({user_id:myId(),week_start:week,text:v})); S.refocus='goal'; await reload(); }catch(e){ toast(writeErr(e)); } };
+  inp.addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); add(); } });
+  if(S.refocus==='goal'){ S.refocus=null; setTimeout(()=>inp.focus(),0); }
+  return h('div',{class:'gadd'},inp,h('button',{class:'btn small primary',onclick:add},'Add'));
+}
+function goalRow(g,editable){
+  return h('div',{class:'goal'},
+    h('input',{type:'checkbox',checked:g.done?'':null,disabled:editable?null:'','aria-label':g.text,onchange:async e=>{ try{ await dbw(sb.from('weekly_goals').update({done:e.target.checked}).eq('id',g.id)); await reload(); }catch(err){ toast(writeErr(err)); } }}),
+    h('span',{class:g.done?'gdone':'',text:g.text}),
+    editable?h('button',{class:'x-close',style:'font-size:18px','aria-label':'Remove goal',onclick:async()=>{ try{ await delRow('weekly_goals',g.id); }catch(err){ toast(writeErr(err)); } }},'×'):null);
+}
+function goalsMini(){
+  const wk=weekISO(), me=myId(), mine=S.goals.filter(g=>g.userId===me&&g.week===wk);
+  const members=activeMembers(), setBy=new Set(S.goals.filter(g=>g.week===wk).map(g=>g.userId)), d=mine.filter(g=>g.done).length;
+  return h('div',{class:'panel sec acc-green'},
+    h('div',{class:'ph'},h('h3',{text:'My weekly goals · '+weekLabel(wk)}),h('button',{class:'btn small ghost sp',onclick:()=>go('goals')},'Team goals')),
+    mine.length?h('div',{class:'bar',style:'margin-bottom:8px'},h('i',{style:'width:'+Math.round(d/mine.length*100)+'%'})):h('p',{class:'empty',text:'You have not set goals for this week yet.'}),
+    ...mine.map(g=>goalRow(g,S.canWrite)), S.canWrite?goalAdder(wk):null,
+    h('p',{class:'hint',style:'margin:10px 0 0',text:setBy.size+' of '+members.length+' team members have set goals this week.'}));
+}
+function goalsView(view){
+  const wk=S.goalWeek||weekISO(), me=myId(), thisWk=weekISO();
+  const shift=n=>{ const d=parseD(wk); d.setDate(d.getDate()+7*n); S.goalWeek=iso(d); render(); };
+  view.append(h('div',{class:'page-head'},h('div',{},h('h2',{text:'Weekly goals'}),h('p',{text:'Everyone sets their goals for the week. Tick them off as you go.'})),
+    h('div',{class:'sp',style:'align-items:center'},h('button',{class:'btn small','aria-label':'Previous week',onclick:()=>shift(-1)},'‹'),h('b',{text:(wk===thisWk?'This week · ':'')+weekLabel(wk)}),h('button',{class:'btn small','aria-label':'Next week',onclick:()=>shift(1)},'›'),wk!==thisWk?h('button',{class:'btn small',onclick:()=>{ S.goalWeek=null; render(); }},'This week'):null)));
+  const mine=S.goals.filter(g=>g.userId===me&&g.week===wk);
+  if(S.canWrite) view.append(h('div',{class:'panel sec'},h('h3',{text:'My goals'}),mine.length?mine.map(g=>goalRow(g,true)):h('p',{class:'empty',text:'No goals for this week yet. Add your first one below.'}),goalAdder(wk)));
+  const people=activeMembers().filter(p=>p.id!==me).sort((a,b)=>pn(a.id).localeCompare(pn(b.id)));
+  view.append(h('div',{class:'panel'},h('h3',{text:'Team goals'}),people.length?h('div',{class:'gcards'},people.map(p=>{
+    const gs=S.goals.filter(g=>g.userId===p.id&&g.week===wk), d=gs.filter(g=>g.done).length;
+    return h('div',{class:'gcard'},h('div',{style:'display:flex;gap:8px;align-items:center;margin-bottom:6px'},avatar(p.id,26),h('b',{text:pn(p.id)}),h('span',{class:'hint',style:'margin-left:auto',text:gs.length?d+'/'+gs.length:''})),
+      gs.length?[h('div',{class:'bar',style:'margin-bottom:6px'},h('i',{style:'width:'+Math.round(d/gs.length*100)+'%'})),gs.map(g=>goalRow(g,false))]:h('p',{class:'hint',style:'margin:0',text:'No goals set yet.'}));
+  })):h('p',{class:'empty',text:'No other team members yet.'})));
+}
+
+/* ---------- Media ---------- */
+function mediaCard(p,compact){
+  const me=myId(), cs=S.confirms.filter(c=>c.postId===p.id), mine=cs.find(c=>c.userId===me);
+  const members=activeMembers(), total=members.length||1;
+  const ok=cs.filter(c=>c.response==='approved').length, chg=cs.filter(c=>c.response==='changes').length;
+  const published=p.status==='published', late=!published&&p.confirmBy&&p.confirmBy<todayStr()&&!mine;
+  const note=h('input',{type:'text',placeholder:'Comment (optional)',value:mine?mine.comment:'','aria-label':'Comment on this post'});
+  const reply=async r=>{ try{ await dbw(sb.from('media_confirmations').upsert({post_id:p.id,user_id:me,response:r,comment:note.value.trim(),updated_at:new Date().toISOString()},{onConflict:'post_id,user_id'})); await reload(); toast(r==='approved'?'Thanks, you confirmed this post':'Your feedback was sent'); }catch(e){ toast(writeErr(e)); } };
+  const card=h('div',{class:'mpost'+(late?' late':'')},
+    h('div',{class:'mp-top'},h('span',{class:'tag todo',text:p.platform}),h('span',{class:'tag '+(published?'done':'progress'),text:published?'Published':'Awaiting confirmation'}),
+      h('span',{class:'hint',text:'Post on '+dLong(p.postDate)}),(!published&&p.confirmBy)?h('span',{class:late?'red':'hint',text:'Confirm by '+dShort(p.confirmBy)}):null),
+    h('h4',{text:p.title}),
+    p.caption?h('p',{class:'caption',text:compact?trunc(p.caption,140):p.caption}):null,
+    compact?attCount('media_post',p.id):attList('media_post',p.id),
+    safeLink(p.link)?h('a',{class:'btn small',href:p.link,target:'_blank',rel:'noopener'},'Open draft or design'):null,
+    h('div',{class:'cprog'},h('div',{class:'bar'},h('i',{style:'width:'+Math.round(ok/total*100)+'%'})),h('span',{class:'hint',text:ok+' of '+members.length+' confirmed'+(chg?' · '+chg+' want changes':'')})),
+    (!published&&S.canWrite)?h('div',{class:'rsvp'},h('div',{class:'seg small',role:'group','aria-label':'Your confirmation'},
+      h('button',{class:'g',type:'button','aria-pressed':mine&&mine.response==='approved'?'true':'false',onclick:()=>reply('approved')},'✓ Confirm'),
+      h('button',{type:'button','aria-pressed':mine&&mine.response==='changes'?'true':'false',onclick:()=>reply('changes')},'Needs changes')),note):null);
+  if(!compact){
+    card.append(h('details',{class:'resp'},h('summary',{text:'Team responses'}),...members.map(m=>{ const c=cs.find(x=>x.userId===m.id);
+      return h('div',{class:'rr'},avatar(m.id,22),h('span',{text:pn(m.id)}),h('span',{class:'tag '+(c?(c.response==='approved'?'done':'over'):'todo'),text:c?(c.response==='approved'?'Confirmed':'Wants changes'):'Waiting'}),c&&c.comment?h('span',{class:'hint',text:'“'+c.comment+'”'}):null); })));
+    { const ad=attAdder('media_post',p.id,'Add photo or video'); if(ad) card.append(ad); }
+    if(S.canMedia) card.append(h('div',{style:'display:flex;gap:6px;flex-wrap:wrap;margin-top:10px'},
+      published?h('button',{class:'btn small',onclick:()=>setPostStatus(p,'awaiting')},'Mark as not published'):h('button',{class:'btn small green',onclick:()=>setPostStatus(p,'published')},'Mark as published'),
+      h('button',{class:'btn small',onclick:()=>openShare(shareForPost(p))},'Remind team'),
+      h('button',{class:'btn small ghost',onclick:()=>postForm(p)},'Edit'),confirmDel(()=>delRow('media_posts',p.id))));
+  }
+  return card;
+}
+async function setPostStatus(p,status){ try{ await dbw(sb.from('media_posts').update({status}).eq('id',p.id)); await reload(); toast(status==='published'?'Marked as published':'Marked as awaiting'); }catch(e){ toast(writeErr(e)); } }
+function mediaView(view){
+  const leads=activeMembers().filter(p=>p.isComms||p.position==='communication');
+  view.append(h('div',{class:'page-head'},h('div',{},h('h2',{text:'Media'}),h('p',{text:leads.length?'Communication lead: '+leads.map(p=>pn(p.id)).join(', ')+'. Please confirm each coming post.':'No communication lead is set yet. An admin can choose one in the Team tab.'})),
+    S.canMedia?h('div',{class:'sp'},h('button',{class:'btn primary',onclick:()=>postForm()},'+ New post')):null));
+  const waiting=S.posts.filter(p=>p.status!=='published').sort((a,b)=>a.postDate.localeCompare(b.postDate));
+  const pub=S.posts.filter(p=>p.status==='published').sort((a,b)=>b.postDate.localeCompare(a.postDate)).slice(0,10);
+  view.append(h('div',{class:'panel sec'},h('h3',{text:'Coming posts'}),waiting.length?waiting.map(p=>mediaCard(p,false)):h('p',{class:'empty',text:S.canMedia?'No posts yet. Add the first one with “+ New post”.':'No posts are waiting for confirmation.'})));
+  if(pub.length) view.append(h('div',{class:'panel'},h('h3',{text:'Published'}),pub.map(p=>mediaCard(p,false))));
+}
+function postForm(p){
+  const ex=!!p;
+  const title=h('input',{type:'text',value:ex?p.title:'',placeholder:'e.g. World Water Day announcement'});
+  const platform=h('select',{},...PLATFORMS.map(x=>h('option',{value:x,text:x}))); platform.value=ex&&PLATFORMS.includes(p.platform)?p.platform:'Facebook';
+  const postDate=h('input',{type:'date',value:ex?p.postDate:iso(new Date(Date.now()+3*864e5))});
+  const confirmBy=h('input',{type:'date',value:ex?(p.confirmBy||''):iso(new Date(Date.now()+2*864e5))});
+  const caption=h('textarea',{rows:5,placeholder:'The text of the post'}); caption.value=ex?(p.caption||''):'';
+  const link=h('input',{type:'text',value:ex?(p.link||''):'',placeholder:'https://… (design, photo or document)'});
+  const files=attPicker('media_post',ex?p.id:null);
+  openForm(ex?'Edit post':'New media post',[field('Title',title),h('div',{class:'two'},field('Platform',platform),field('Post date',postDate)),field('Team should confirm by',confirmBy,'Members who have not replied by this date show in red.'),field('Post text',caption),field('Link to design or draft (optional)',link),field('Photos, videos and files',files.el)],async()=>{
+    if(!title.value.trim()||!postDate.value){ toast('Add a title and the post date.'); return false; }
+    if(link.value.trim()&&!safeLink(link.value.trim())){ toast('The link must start with https://'); return false; }
+    const data={title:title.value.trim(),platform:platform.value,post_date:postDate.value,confirm_by:confirmBy.value||null,caption:caption.value.trim(),link:link.value.trim()};
+    if(ex){ await dbw(sb.from('media_posts').update(data).eq('id',p.id)); await safeUpload(files,p.id); }
+    else { const res=await dbw(sb.from('media_posts').insert({...data,status:'awaiting',created_by:myId()}).select('id').single()); await safeUpload(files,res.id);
+      toast('Post added','Ask team to confirm',()=>openShare(shareForPost({id:res.id,title:data.title,platform:data.platform,postDate:data.post_date,confirmBy:data.confirm_by||'',caption:data.caption}))); }
+    reload();
+  },ex?'Save changes':'Add post');
+}
+
+/* ---------- My board ---------- */
+function mineView(view){
+  const me = myId();
+  const mineTasks = (me ? S.tasks.filter(t=>t.ownerId===me) : S.tasks).filter(matches);
+  view.append(h('div',{class:'page-head'}, h('div',{}, h('h2',{text:'My board'}), h('p',{text:me?'Your tasks. Open one to post an update or change its status.':'Showing all tasks.'})),
+    h('div',{class:'sp'}, S.canWrite?h('button',{class:'btn primary',onclick:()=>taskForm()},'+ New task'):null)));
+  const cols = h('div',{class:'cols'});
+  for (const st of ['todo','progress','done']){
+    const items = mineTasks.filter(t=>t.status===st).sort(byDue);
+    cols.append(h('section',{class:'col'+(st==='done'?' c-done':'')}, h('h3',{}, STATUS[st], h('span',{text:items.length})),
+      items.length?items.map(taskCard):h('div',{class:'empty',text:st==='todo'?'Nothing waiting.':st==='progress'?'Nothing in progress.':'No finished tasks yet.'})));
+  }
+  view.append(filterBar(), cols);
+  if (me){
+    const ment = S.tasks.filter(t=>(t.mentions||[]).includes(me)&&t.ownerId!==me).sort(byDue);
+    if (ment.length) view.append(h('div',{class:'panel',style:'margin-top:16px'}, h('h3',{text:'You are mentioned in'}), ...ment.map(taskRow)));
+  }
+}
+
+/* ---------- Admin board ---------- */
+function adminView(view){
+  const T = S.tasks, over = T.filter(isOver);
+  view.append(h('div',{class:'page-head'}, h('div',{}, h('h2',{text:'Admin board'}), h('p',{text:'Everyone’s tasks and progress in one place.'})), h('div',{class:'sp'}, h('button',{class:'btn',onclick:weeklySummary},'Weekly summary'), h('button',{class:'btn',onclick:exportCsv},'Export CSV'), h('button',{class:'btn primary',onclick:()=>taskForm()},'+ New task'))));
+  view.append(h('div',{class:'stats'},
+    h('div',{class:'stat'},h('b',{text:T.length}),h('span',{text:'Total tasks'})),
+    h('div',{class:'stat'},h('b',{text:T.filter(t=>t.status==='progress').length}),h('span',{text:'In progress'})),
+    h('div',{class:'stat s-green'},h('b',{text:T.filter(t=>t.status==='done').length}),h('span',{text:'Done'})),
+    h('div',{class:'stat s-red'},h('b',{text:over.length}),h('span',{text:'Overdue'}))));
+  { const used=S.attachments.reduce((a,x)=>a+(x.size||0),0), cap=1024*1024*1024, pct=Math.min(100,Math.round(used/cap*100));
+    view.append(h('div',{class:'panel sec acc-orange'},h('div',{class:'ph'},h('h3',{text:'File storage'})),h('div',{class:'bar'+(pct>80?' over':'')},h('i',{style:'width:'+pct+'%'})),
+      h('p',{class:'hint',style:'margin:8px 0 0',text:fmtSize(used)+' of about 1 GB used on the Supabase free plan ('+pct+'%). Check Project Settings in Supabase for the exact figure. Use YouTube or Drive links for long videos.'}))); }
+  // per person
+  const people = [...new Set(T.map(t=>t.ownerId).filter(Boolean))];
+  const rows = people.map(id=>{
+    const mt=T.filter(t=>t.ownerId===id), d=mt.filter(t=>t.status==='done').length, o=mt.filter(isOver).length;
+    const avg=Math.round(mt.reduce((a,t)=>a+(t.status==='done'?100:(t.progress||0)),0)/mt.length);
+    return h('tr',{class:'click',onclick:()=>{S.filter.person=id;render();}},
+      h('td',{},who(id,26)), h('td',{text:mt.length}), h('td',{text:d}), h('td',{},o?h('span',{class:'tag over'},h('span',{class:'pulse-dot',style:'width:7px;height:7px;margin-right:6px'}),o):'0'),
+      h('td',{style:'min-width:150px'},h('div',{style:'display:flex;gap:8px;align-items:center'},h('div',{class:'bar',style:'flex:1'},h('i',{style:'width:'+avg+'%'})),h('span',{class:'hint',text:avg+'%'}))));
+  });
+  view.append(h('div',{class:'panel',style:'margin-bottom:16px'}, h('h3',{text:'Progress by person'}),
+    rows.length?h('div',{class:'tbl-wrap'},h('table',{},h('thead',{},h('tr',{},h('th',{text:'Person'}),h('th',{text:'Assigned'}),h('th',{text:'Done'}),h('th',{text:'Overdue'}),h('th',{text:'Progress'}))),h('tbody',{},rows))):h('p',{class:'empty',text:'Assign tasks to people to see their progress here.'})));
+  // filters + all tasks
+  const fp = h('select',{'aria-label':'Filter by person',onchange:e=>{S.filter.person=e.target.value;render();}}, h('option',{value:'all',text:'Everyone'}), ...people.map(id=>h('option',{value:id,text:nm(id)})));
+  fp.value = people.includes(S.filter.person)?S.filter.person:'all';
+  const fs = h('select',{'aria-label':'Filter by status',onchange:e=>{S.filter.status=e.target.value;render();}}, h('option',{value:'all',text:'All statuses'}), h('option',{value:'todo',text:'To do'}), h('option',{value:'progress',text:'In progress'}), h('option',{value:'done',text:'Done'}), h('option',{value:'over',text:'Overdue'}));
+  fs.value = S.filter.status;
+  let list = T.filter(t=>(fp.value==='all'||t.ownerId===fp.value)&&(S.filter.status==='all'||(S.filter.status==='over'?isOver(t):t.status===S.filter.status))&&matches(t)).sort(byDue);
+  view.append(h('div',{class:'panel'}, h('h3',{text:'All tasks'}), h('div',{class:'filters'},fp,fs,...[...filterBar().children]),
+    list.length?h('div',{class:'tbl-wrap'},h('table',{},h('thead',{},h('tr',{},h('th',{text:'Task'}),h('th',{text:'Owner'}),h('th',{text:'Due'}),h('th',{text:'Status'}),h('th',{text:'Progress'}))),
+      h('tbody',{},list.map(t=>h('tr',{class:'click',onclick:()=>openTask(t.id)},
+        h('td',{},h('b',{text:t.title})), h('td',{},t.ownerId?who(t.ownerId,22):'—'),
+        h('td',{},isOver(t)?h('span',{class:'red',text:dueLabel(t)}):dShort(t.due)),
+        h('td',{},h('span',{class:'tag '+t.status,text:STATUS[t.status]})), h('td',{text:(t.status==='done'?100:(t.progress||0))+'%'})))))):h('p',{class:'empty',text:'No tasks match.'})));
+}
+
+/* ---------- weekly summary & export ---------- */
+function weeklySummary(){
+  const wk=Date.now()-7*864e5, T=S.tasks;
+  const done=T.filter(t=>t.status==='done'&&t.completedAt&&t.completedAt>=wk), over=T.filter(isOver), prog=T.filter(t=>t.status==='progress');
+  const L=t=>'• '+t.title+(t.ownerId?' ('+pn(t.ownerId)+')':'');
+  const msg='📊 Weekly summary · Nile Youth Network\n\n✅ Completed this week ('+done.length+'):\n'+(done.map(L).join('\n')||'None')+'\n\n🔵 In progress ('+prog.length+'):\n'+(prog.map(L).join('\n')||'None')+'\n\n🔴 Overdue ('+over.length+'):\n'+(over.map(t=>L(t)+' – due '+dShort(t.due)).join('\n')||'None')+'\n\nTracker: '+trackerLink();
+  openShare({title:'Weekly summary',message:msg,ids:[...new Set(T.map(t=>t.ownerId).filter(Boolean))].filter(i=>i!==myId()),subject:'Weekly task summary'});
+}
+function exportCsv(){
+  const q=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';
+  const rows=[['Task','Team','Owner','Status','Progress %','Priority','Due','Overdue','Created']];
+  S.tasks.forEach(t=>rows.push([t.title,t.team||'',t.ownerId?pn(t.ownerId):'',STATUS[t.status],t.status==='done'?100:(t.progress||0),PRIO[t.priority||'med'],t.due||'',isOver(t)?'Yes':'No',t.createdAt?iso(new Date(t.createdAt)):'']));
+  const blob=new Blob(['\ufeff'+rows.map(r=>r.map(q).join(',')).join('\n')],{type:'text/csv'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='nile-youth-tasks-'+todayStr()+'.csv';
+  document.body.append(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+
+/* ---------- Calendar ---------- */
+function calendarView(view){
+  const m=S.calMonth, y=m.getFullYear(), mo=m.getMonth();
+  const startOff=(new Date(y,mo,1).getDay()+6)%7, dim=new Date(y,mo+1,0).getDate();
+  const total=Math.ceil((startOff+dim)/7)*7, today=todayStr();
+  view.append(h('div',{class:'page-head'}, h('div',{}, h('h2',{text:'Calendar'}), h('p',{text:'Task deadlines and meetings. Overdue tasks pulse in red.'})), h('div',{class:'sp'}, S.canWrite?h('button',{class:'btn primary',onclick:()=>taskForm()},'+ New task'):null)));
+  const grid=h('div',{class:'cal'});
+  ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].forEach(d=>grid.append(h('div',{class:'dow',text:d})));
+  for (let i=0;i<total;i++){
+    const day=i-startOff+1;
+    if (day<1||day>dim){ grid.append(h('div',{class:'day blank'})); continue; }
+    const ds=y+'-'+pad(mo+1)+'-'+pad(day);
+    const ts=S.tasks.filter(t=>t.due===ds), ms=S.meetings.filter(x=>x.date===ds);
+    const hasOver=ts.some(isOver);
+    const ps=S.posts.filter(p=>p.postDate===ds&&p.status!=='published');
+    const evs=[...ms.map(x=>({c:'meet',l:(x.time?x.time+' ':'')+x.title})),...ts.map(t=>({c:isOver(t)?'over':t.status==='done'?'done':'',l:t.title})),...ps.map(p=>({c:'post',l:'Post: '+p.title}))];
+    grid.append(h('button',{class:'day'+(ds===today?' today':'')+(S.calSel===ds?' sel':''),onclick:()=>{S.calSel=ds;render();},'aria-label':dLong(ds)+', '+evs.length+' items'},
+      h('div',{class:'dayhead'},h('span',{class:'dn',text:day}),hasOver?h('span',{class:'pulse-dot',style:'width:8px;height:8px'}):null),
+      ...evs.slice(0,3).map(e=>h('span',{class:'ev '+e.c,text:e.l})), evs.length>3?h('span',{class:'hint',text:'+'+(evs.length-3)+' more'}):null,
+      h('div',{class:'dots'},...evs.slice(0,6).map(e=>h('span',{class:'dot '+e.c})))));
+  }
+  view.append(h('div',{class:'panel'},
+    h('div',{class:'cal-head'}, h('button',{class:'btn small','aria-label':'Previous month',onclick:()=>{S.calMonth=new Date(y,mo-1,1);render();}},'‹'),
+      h('h3',{text:m.toLocaleDateString(undefined,{month:'long',year:'numeric'})}),
+      h('button',{class:'btn small',onclick:()=>{S.calMonth=new Date();S.calSel=todayStr();render();}},'Today'),
+      h('button',{class:'btn small','aria-label':'Next month',onclick:()=>{S.calMonth=new Date(y,mo+1,1);render();}},'›')),
+    grid,
+    h('div',{class:'legend'}, h('span',{},h('i',{class:'dot'}),'Task due'), h('span',{},h('i',{class:'dot over'}),'Overdue'), h('span',{},h('i',{class:'dot done'}),'Done'), h('span',{},h('i',{class:'dot meet'}),'Meeting / event'), h('span',{},h('i',{class:'dot post'}),'Media post'))));
+  const sel=S.calSel;
+  if (sel){
+    const ts=S.tasks.filter(t=>t.due===sel), ms=S.meetings.filter(x=>x.date===sel);
+    view.append(h('div',{class:'panel',style:'margin-top:16px'}, h('h3',{text:dLong(sel)}),
+      ...ms.map(x=>meetingCard(x,false)), ...ts.map(taskRow), ...S.posts.filter(p=>p.postDate===sel).map(p=>mediaCard(p,true)), (!ts.length&&!ms.length&&!S.posts.some(p=>p.postDate===sel))?h('p',{class:'empty',text:'Nothing on this day.'}):null));
+  }
+}
+
+/* ---------- Meetings & minutes ---------- */
+function meetingCard(m,compact){
+  const d=parseD(m.date), me=myId();
+  const rs=S.rsvps.filter(r=>r.meetingId===m.id), mine=rs.find(r=>r.userId===me);
+  const cnt=k=>rs.filter(r=>r.response===k).length;
+  const late=m.rsvpBy&&m.rsvpBy<todayStr()&&!mine;
+  const note=h('input',{type:'text',placeholder:'Add a note about your participation',value:mine?mine.comment:'','aria-label':'Participation note'});
+  const reply=async r=>{ try{ await dbw(sb.from('meeting_rsvps').upsert({meeting_id:m.id,user_id:me,response:r,comment:note.value.trim(),updated_at:new Date().toISOString()},{onConflict:'meeting_id,user_id'})); await reload(); toast('Your reply is saved'); }catch(e){ toast(writeErr(e)); } };
+  const btn=(r,l,cls)=>h('button',{type:'button',class:cls||'','aria-pressed':mine&&mine.response===r?'true':'false',onclick:()=>reply(r)},l);
+  const members=activeMembers();
+  const body=h('div',{style:'flex:1;min-width:0'},
+    h('div',{style:'display:flex;gap:8px;align-items:center;flex-wrap:wrap'},h('span',{class:'t',style:'font-weight:600',text:m.title}),h('span',{class:'tag '+(KIND_TAG[m.kind]||KIND_TAG.meeting)[1],text:(KIND_TAG[m.kind]||KIND_TAG.meeting)[0]})),
+    h('div',{class:'s hint',text:dLong(m.date)+(m.time?' · '+m.time:'')+(m.place?' · '+m.place:'')+(m.hostId?' · Led by '+pn(m.hostId):'')}),
+    safeLink(m.meetLink)?h('div',{},h('a',{class:'btn small meet',href:m.meetLink,target:'_blank',rel:'noopener'},'Join Google Meet')):null,
+    (m.agenda&&!compact)?h('p',{style:'margin:8px 0 0;white-space:pre-wrap',text:m.agenda}):null,
+    compact?attCount('meeting',m.id):attList('meeting',m.id),
+    S.canWrite?h('div',{class:'rsvp'},h('div',{class:'seg small',role:'group','aria-label':'Will you join?'},btn('going','Going','g'),btn('maybe','Maybe'),btn('no','Can’t go')),note):null,
+    h('div',{class:'hint',style:'margin-top:6px'},cnt('going')+' going · '+cnt('maybe')+' maybe · '+cnt('no')+' can’t go',
+      m.rsvpBy?[' · ',h('span',{class:late?'red':'',text:'Reply by '+dShort(m.rsvpBy)+(late?' (you have not replied)':'')})]:null));
+  if(!compact){
+    body.append(h('details',{class:'resp'},h('summary',{text:'Who is joining'}),...members.map(p=>{ const r=rs.find(x=>x.userId===p.id);
+      return h('div',{class:'rr'},avatar(p.id,22),h('span',{text:pn(p.id)}),h('span',{class:'tag '+(r?(r.response==='going'?'done':r.response==='maybe'?'progress':'over'):'todo'),text:r?(r.response==='going'?'Going':r.response==='maybe'?'Maybe':'Can’t go'):'No reply'}),r&&r.comment?h('span',{class:'hint',text:'“'+r.comment+'”'}):null); })));
+  }
+  if(!compact){ const ad=attAdder('meeting',m.id,'Add file or video'); if(ad) body.append(ad); }
+  body.append(h('div',{style:'display:flex;gap:6px;margin-top:8px;flex-wrap:wrap'},
+    h('button',{class:'btn small',onclick:()=>openShare(shareForMeeting(m))},'Share'),
+    (!compact&&(S.canSchedule||(m.kind==='training'&&S.canTrain)))?[h('button',{class:'btn small',onclick:()=>minutesForm(null,m)},'Post minutes'),h('button',{class:'btn small ghost',onclick:()=>meetingForm(m)},'Edit'),confirmDel(()=>delRow('meetings',m.id))]:null));
+  return h('div',{class:'mcard'},h('div',{class:'dateblock'},h('b',{text:d.getDate()}),h('span',{text:d.toLocaleDateString(undefined,{month:'short'})})),body);
+}
+
+function confirmDel(fn,label='Delete'){
+  let armed=false;
+  const b=h('button',{class:'btn small ghost',style:'color:var(--red)',onclick:async()=>{
+    if(!armed){armed=true;b.textContent='Tap again to confirm';setTimeout(()=>{armed=false;b.textContent=label;},3000);return;}
+    try{await fn();toast('Deleted');}catch(e){toast(writeErr(e));}
+  }},label);
+  return b;
+}
+function minuteCard(x,open){
+  const n=attsFor('minute',x.id).length;
+  return h('details',{class:'minute',open:open?true:null},
+    h('summary',{},h('b',{text:x.title}),h('span',{class:'hint',text:dLong(x.date)}),n?h('span',{class:'tag progress',text:n+' attachment'+(n>1?'s':'')}):null),
+    h('div',{class:'mb'},
+      x.attendees?h('div',{},h('h5',{text:'Attendees'}),h('p',{text:x.attendees})):null,
+      x.summary?h('div',{},h('h5',{text:'Discussion'}),h('p',{text:x.summary})):null,
+      x.decisions?h('div',{},h('h5',{text:'Decisions'}),h('p',{text:x.decisions})):null,
+      x.actions?h('div',{},h('h5',{text:'Action items'}),h('p',{text:x.actions})):null,
+      h('div',{},h('h5',{text:'Attachments'}),attList('minute',x.id)||h('p',{class:'hint',text:'No attachments yet.'}),attAdder('minute',x.id,'Add file, photo or video')),
+      h('div',{class:'hint',text:'Posted by '+nm(x.createdBy)}),
+      h('div',{style:'display:flex;gap:6px;flex-wrap:wrap'},
+        h('button',{class:'btn small',onclick:()=>openShare(shareForMinutes(x))},'Share'),
+        S.canMinutes?[h('button',{class:'btn small',onclick:()=>taskForm(null,x.actions?x.actions.split('\n')[0]:'')},'Create task from action'),h('button',{class:'btn small ghost',onclick:()=>minutesForm(x)},'Edit'),confirmDel(()=>delRow('minutes',x.id))]:null)));
+}
+function meetingsView(view){
+  const canNew=S.canSchedule||S.canTrain;
+  view.append(h('div',{class:'page-head'},h('div',{},h('h2',{text:'Meetings & events'}),h('p',{text:'Upcoming meetings, events and trainings, your replies, and the minutes with their attachments.'})),
+    canNew?h('div',{class:'sp'},h('button',{class:'btn',onclick:()=>meetingForm()},'+ Schedule'),S.canMinutes?h('button',{class:'btn primary',onclick:()=>minutesForm()},'+ Post minutes'):null):null));
+  const upcoming=S.meetings.filter(m=>m.date>=todayStr()).sort(cmpMeet);
+  const mins=[...S.minutes].sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+  const left=h('div',{class:'panel acc-blue'},h('div',{class:'ph'},h('h3',{text:'Upcoming'})),upcoming.length?upcoming.map(m=>meetingCard(m,false)):h('p',{class:'empty',text:canNew?'Nothing scheduled. Schedule a meeting, event or training to see it here and on the calendar.':'Nothing is scheduled yet.'}));
+  const right=h('div',{class:'panel acc-amber'},h('div',{class:'ph'},h('h3',{text:'Meeting minutes'})),
+    mins.length?mins.map((x,i)=>minuteCard(x,i<3)):h('p',{class:'empty',text:S.canMinutes?'No minutes yet. Post the first one after your next meeting.':'No minutes have been posted yet.'}));
+  view.append(h('div',{class:'grid2'},right,left));
+}
+
+/* ---------- dialogs ---------- */
+for (const d of document.querySelectorAll('dialog')) d.addEventListener('click',e=>{ if(e.target===d) d.close(); });
+function openForm(title, bodyNodes, onSave, saveLabel='Save'){
+  const dlg=$('#dForm'), body=$('#formBody');
+  const err=h('div',{class:'red',style:'min-height:0'});
+  const save=h('button',{class:'btn primary',onclick:async()=>{
+    err.textContent=''; save.disabled=true;
+    try{ const r = await onSave(); if (r===false){save.disabled=false;return;} dlg.close(); }
+    catch(e){ err.textContent=writeErr(e); save.disabled=false; }
+  }},saveLabel);
+  rc(body,h('div',{class:'dlg-head'},h('h3',{text:title}),h('button',{class:'x-close','aria-label':'Close',onclick:()=>dlg.close()},'×')), ...bodyNodes, err, h('div',{class:'actions'},h('button',{class:'btn',onclick:()=>dlg.close()},'Cancel'),save));
+  dlg.showModal();
+}
+const field=(label,el,hint)=>h('div',{class:'field'},h('label',{text:label}),el,hint?h('small',{text:hint}):null);
+
+function taskForm(t, titlePrefill, teamPrefill){
+  const ex=!!t;
+  const title=h('input',{type:'text',value:ex?t.title:(titlePrefill||''),placeholder:'e.g. Collect river water quality samples'});
+  const desc=h('textarea',{rows:3,placeholder:'What needs to be done?'}); desc.value=ex?(t.description||''):'';
+  const owner=picker({ids:ex?(t.ownerId?[t.ownerId]:[]):(myId()?[myId()]:[]),placeholder:'Assign to…'});
+  const due=h('input',{type:'date',value:ex?(t.due||''):iso(new Date(Date.now()+7*864e5))});
+  const prio=h('select',{},...Object.entries(PRIO).map(([k,l])=>h('option',{value:k,text:l}))); prio.value=ex?(t.priority||'med'):'med';
+  const team=h('input',{type:'text',value:ex?(t.team||''):(teamPrefill||''),placeholder:'e.g. Water quality, Advocacy',list:'teamList'});
+  const files=attPicker('task',ex?t.id:null);
+  const tdl=h('datalist',{id:'teamList'},...teamsList().map(x=>h('option',{value:x})));
+  const ment=picker({multi:true,ids:ex?(t.mentions||[]):[],placeholder:'Mention teammates…'});
+  const nodes=[ field('Task title',title), field('Description',desc),
+    h('div',{class:'two'}, field('Owner',owner.el), field('Due date',due)),
+    h('div',{class:'two'}, field('Team or workstream',[team,tdl],'Group tasks, e.g. Water quality or Advocacy.'), field('Priority',prio)),
+    field('Mention people',ment.el,'They will be listed on the task so you can notify them.'),
+    field('Files, photos and videos',files.el) ];
+  openForm(ex?'Edit task':'New task',nodes,async()=>{
+    if(!title.value.trim()){ title.focus(); toast('Please add a task title.'); return false; }
+    if(!due.value){ due.focus(); toast('Please choose a due date so it shows on the calendar.'); return false; }
+    const o=owner.get()[0]||null, data={title:title.value.trim(),description:desc.value.trim(),ownerId:o,due:due.value,priority:prio.value,team:team.value.trim(),mentions:ment.get(),updatedAt:Date.now()};
+    if(ex){ await dbw(sb.from('tasks').update(taskDb(data)).eq('id',t.id)); const added=data.mentions.filter(i=>!(t.mentions||[]).includes(i)); if(added.length) await logMention(t.id,added); await safeUpload(files,t.id); toast('Task updated'); }
+    else {
+      Object.assign(data,{status:'todo',progress:0});
+      const res=await dbw(sb.from('tasks').insert({...taskDb(data),created_by:myId()}).select('id').single());
+      if(data.mentions.length) await logMention(res.id,data.mentions);
+      await safeUpload(files,res.id);
+      toast('Task created','Notify team',()=>{ openShare(shareForTask({id:res.id,...data,createdBy:myId()},'assigned')); });
+    }
+    reload();
+  }, ex?'Save changes':'Create task');
+}
+function meetingForm(m,forceKind){
+  const ex=!!m, tOnly=!S.canSchedule&&S.canTrain;
+  const kind=h('select',{},...(tOnly?[['training','Training']]:[['meeting','Meeting'],['event','Event'],['training','Training']]).map(([v,l])=>h('option',{value:v,text:l}))); kind.value=ex?(m.kind||'meeting'):(forceKind||(tOnly?'training':'meeting'));
+  const title=h('input',{type:'text',value:ex?m.title:'',placeholder:'e.g. Weekly coordination meeting'});
+  const date=h('input',{type:'date',value:ex?m.date:todayStr()}), time=h('input',{type:'time',value:ex?(m.time||''):''});
+  const place=h('input',{type:'text',value:ex?(m.place||''):'',placeholder:'Room or address (optional)'});
+  const meet=h('input',{type:'text',value:ex?(m.meetLink||''):'',placeholder:'https://meet.google.com/abc-defg-hij'});
+  const rsvpBy=h('input',{type:'date',value:ex?(m.rsvpBy||''):''});
+  const host=picker({ids:ex&&m.hostId?[m.hostId]:[],placeholder:'Led by (optional)…'});
+  const agenda=h('textarea',{rows:4,placeholder:'Agenda or topics'}); agenda.value=ex?(m.agenda||''):'';
+  const files=attPicker('meeting',ex?m.id:null);
+  openForm(ex?'Edit '+(KIND_TAG[m.kind]||KIND_TAG.meeting)[0].toLowerCase():'Schedule',[
+    h('div',{class:'two'},field('Type',kind),field('Title',title)),
+    h('div',{class:'two'},field('Date',date),field('Time',time)),
+    field('Google Meet link',meet,'At meet.google.com choose New meeting, Create a meeting for later, then paste the link here.'),
+    h('div',{class:'two'},field('Place (optional)',place),field('Members reply by',rsvpBy,'Due date for members to say if they will join.')),
+    field('Led by / trainer',host.el),
+    field('Agenda or topics',agenda),
+    field('Files, slides and videos',files.el)],async()=>{
+    if(!title.value.trim()||!date.value){ toast('Add a title and date.'); return false; }
+    if(meet.value.trim()&&!safeLink(meet.value.trim())){ toast('The Meet link must start with https://'); return false; }
+    const data={title:title.value.trim(),date:date.value,time:time.value,place:place.value.trim(),agenda:agenda.value.trim(),kind:kind.value,meet_link:meet.value.trim(),rsvp_by:rsvpBy.value||null,host_id:host.get()[0]||null};
+    const view_={title:data.title,date:data.date,time:data.time,place:data.place,agenda:data.agenda,kind:data.kind,meetLink:data.meet_link,rsvpBy:data.rsvp_by||''};
+    if(ex){ await dbw(sb.from('meetings').update(data).eq('id',m.id)); await safeUpload(files,m.id); }
+    else { const res=await dbw(sb.from('meetings').insert({...data,created_by:myId()}).select('id').single()); await safeUpload(files,res.id); toast('Scheduled','Share',()=>openShare(shareForMeeting({id:res.id,...view_}))); }
+    reload();
+  },ex?'Save changes':'Schedule');
+}
+function minutesForm(x, meeting){
+  const ex=!!x;
+  const title=h('input',{type:'text',value:ex?x.title:(meeting?meeting.title:''),placeholder:'e.g. Weekly meeting minutes'});
+  const date=h('input',{type:'date',value:ex?x.date:(meeting?meeting.date:todayStr())});
+  const att=h('textarea',{rows:2,placeholder:'Names of people present'}); att.value=ex?(x.attendees||''):'';
+  const sum=h('textarea',{rows:5,placeholder:'What was discussed'}); sum.value=ex?(x.summary||''):'';
+  const dec=h('textarea',{rows:3,placeholder:'What was decided'}); dec.value=ex?(x.decisions||''):'';
+  const act=h('textarea',{rows:3,placeholder:'Who does what by when (one per line)'}); act.value=ex?(x.actions||''):'';
+  const files=attPicker('minute',ex?x.id:null);
+  openForm(ex?'Edit minutes':'Post meeting minutes',[h('div',{class:'two'},field('Title',title),field('Meeting date',date)),field('Attendees',att),field('Discussion',sum),field('Decisions',dec),field('Action items',act),field('Attachments: photos, documents, recordings and videos',files.el)],async()=>{
+    if(!title.value.trim()||!date.value){ toast('Add a title and date.'); return false; }
+    const data={title:title.value.trim(),date:date.value,attendees:att.value.trim(),summary:sum.value.trim(),decisions:dec.value.trim(),actions:act.value.trim()};
+    if(ex){ await dbw(sb.from('minutes').update(data).eq('id',x.id)); await safeUpload(files,x.id); }
+    else { const res=await dbw(sb.from('minutes').insert({...data,meeting_id:meeting?meeting.id:null,created_by:myId()}).select('id').single()); await safeUpload(files,res.id); toast('Minutes posted','Share',()=>openShare(shareForMinutes({id:res.id,...data}))); }
+    reload();
+  },ex?'Save changes':'Post minutes');
+}
+
+/* ---------- checklist ---------- */
+function checklistNode(t,ro){
+  const items=t.checklist||[];
+  const save=async list=>{
+    const total=list.length, d=list.filter(c=>c.done).length, patch={checklist:list};
+    if(total){ patch.progress=t.status==='done'?100:Math.round(d/total*100); if(d>0&&t.status==='todo') patch.status='progress'; }
+    await patchTask(t,patch);
+    if(total&&d===total&&t.status!=='done') toast('All steps are done','Mark task done',()=>{ const c=curTask(); if(c) setStatus(c,'done'); });
+  };
+  const input=h('input',{type:'text',placeholder:'Add a step…','aria-label':'New step',disabled:ro?'':null});
+  const add=async()=>{ const v=input.value.trim(); if(!v) return; input.value=''; await save([...items,{id:Date.now().toString(36),text:v,done:false}]); };
+  input.addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); add(); } });
+  return h('div',{class:'field'}, h('label',{text:'Checklist'+(items.length?' ('+items.filter(c=>c.done).length+'/'+items.length+')':'')}),
+    ...items.map(c=>h('div',{class:'ck'},
+      h('input',{type:'checkbox',checked:c.done?'':null,disabled:ro?'':null,'aria-label':c.text,onchange:e=>save(items.map(x=>x.id===c.id?{...x,done:e.target.checked}:x))}),
+      h('span',{class:c.done?'ckdone':'',text:c.text}),
+      ro?null:h('button',{class:'x-close',style:'font-size:18px','aria-label':'Remove step',onclick:()=>save(items.filter(x=>x.id!==c.id))},'×'))),
+    ro?null:h('div',{style:'display:flex;gap:8px;margin-top:6px'},input,h('button',{class:'btn small',onclick:add},'Add')));
+}
+
+/* ---------- task detail ---------- */
+let openId=null;
+let tdPick=null;
+function openTask(id){ openId=id; paintTask(); $('#tdText').value=''; tdPick=attPicker('task_update',null); $('#tdFiles').replaceChildren(tdPick.el); $('#dTask').showModal(); }
+const curTask = () => S.tasks.find(t=>t.id===openId);
+const TASK_COLS={title:'title',description:'description',ownerId:'owner_id',due:'due',priority:'priority',team:'team',status:'status',progress:'progress',mentions:'mentions',checklist:'checklist'};
+function taskDb(patch){
+  const o={};
+  for(const k in patch){
+    if(k==='completedAt') o.completed_at=patch[k]?new Date(patch[k]).toISOString():null;
+    else if(TASK_COLS[k]) o[TASK_COLS[k]]=(k==='due'&&!patch[k])?null:patch[k];
+  }
+  o.updated_at=new Date().toISOString(); return o;
+}
+async function logMention(taskId,ids){ await dbw(sb.from('task_updates').insert({task_id:taskId,user_id:myId(),text:JSON.stringify(ids),kind:'mention'})); }
+async function delRow(table,id){ await dbw(sb.from(table).delete().eq('id',id)); await reload(); }
+async function patchTask(t, patch, text, kind){
+  try{
+    if(Object.keys(patch).length) await dbw(sb.from('tasks').update(taskDb(patch)).eq('id',t.id));
+    if(text) await dbw(sb.from('task_updates').insert({task_id:t.id,user_id:myId(),text,kind:kind||'note'}));
+  }catch(e){ toast(writeErr(e)); throw e; }
+  await reload();
+}
+async function setStatus(t,st){
+  if(t.status===st) return;
+  const patch={status:st};
+  if(st==='done'){patch.progress=100;patch.completedAt=Date.now();}
+  else { patch.completedAt=null; if((t.progress||0)>=100) patch.progress=90; if(st==='progress'&&!(t.progress>0)) patch.progress=10; if(st==='todo') patch.progress=Math.min(t.progress||0,10); }
+  await patchTask(t,patch,'Status changed to '+STATUS[st],'status');
+  if(st==='done') openShare(shareForTask({...t,...patch},'done'));
+}
+function paintTask(){
+  const dlg=$('#dTask'); if(!dlg.open && !openId) return;
+  const t=curTask(), body=$('#tdBody');
+  if(!t){ if(dlg.open) dlg.close(); return; }
+  const over=isOver(t), ro=!S.canWrite;
+  const slider=h('input',{type:'range',min:0,max:100,step:5,value:t.progress||0,disabled:ro?'':null,'aria-label':'Progress'});
+  const pv=h('b',{text:(t.progress||0)+'%'});
+  slider.addEventListener('input',()=>{pv.textContent=slider.value+'%';});
+  slider.addEventListener('change',async()=>{
+    const v=Number(slider.value);
+    if(v>=100){ await setStatus(t,'done'); return; }
+    await patchTask(t,{progress:v,...(v>0&&t.status==='todo'?{status:'progress'}:{})},'Progress set to '+v+'%','status');
+  });
+  const seg=h('div',{class:'seg',role:'group','aria-label':'Status'},...Object.entries(STATUS).map(([k,l])=>
+    h('button',{class:k==='done'?'g':'',type:'button','aria-pressed':t.status===k?'true':'false',disabled:ro?'':null,onclick:()=>setStatus(t,k)},l)));
+  const tl=[...(t.updates||[])].sort((a,b)=>b.at-a.at);
+  rc(body,
+    h('div',{class:'dlg-head'},h('h3',{text:t.title}),h('button',{class:'x-close','aria-label':'Close',onclick:()=>dlg.close()},'×')),
+    over?h('div',{class:'alert-over'},h('span',{class:'pulse-dot'}),h('span',{text:dueLabel(t)}),h('button',{class:'btn small danger',onclick:()=>openShare(shareForTask(t,'over'))},'Alert the team')):null,
+    h('div',{class:'meta'}, h('span',{class:'tag '+t.status,text:STATUS[t.status]}), h('span',{class:'prio p-'+(t.priority||'med'),text:PRIO[t.priority||'med']+' priority'}),
+      t.team?h('span',{class:'prio',text:t.team}):null, h('span',{},'Owner: ',t.ownerId?who(t.ownerId,22):'Unassigned'), h('span',{class:over?'red':'',text:t.due?dLong(t.due):'No due date'})),
+    t.description?h('p',{style:'white-space:pre-wrap;margin:0 0 12px',text:t.description}):null,
+    attBlock('task',t.id,'Add files or videos'),
+    (t.mentions&&t.mentions.length)?h('div',{class:'field'},h('label',{text:'Mentioned'}),h('div',{class:'chips'},...t.mentions.map(id=>h('span',{class:'chip'},avatar(id,20),nm(id))))):null,
+    h('div',{class:'field'},h('label',{},'Status'),seg),
+    h('div',{class:'field'},h('label',{},'Progress ',pv),slider),
+    checklistNode(t,ro),
+    h('div',{class:'actions',style:'justify-content:flex-start;margin:0 0 8px'},
+      S.canWrite?h('button',{class:'btn small',onclick:()=>{dlg.close();taskForm(t);}},'Edit task'):null,
+      (S.canWrite&&(S.isAdmin||t.createdBy===myId()))?confirmDel(async()=>{await delRow('tasks',t.id);openId=null;dlg.close();},'Delete task'):null),
+    h('h3',{style:'font-size:16px;margin-top:6px',text:'Updates'}),
+    tl.length?h('div',{class:'tl'},...tl.map(u=>h('div',{class:'it '+(u.kind==='status'?'status':'')},h('div',{class:'h'},nm(u.by)+' · '+ago(u.at)),h('p',{text:updText(u)}),attList('task_update',u.id)))):h('p',{class:'empty',text:'No updates yet.'}));
+  $('#tdCompose').hidden=ro;
+}
+$('#dTask').addEventListener('close',()=>{openId=null;});
+$('#tdPost').addEventListener('click',async()=>{
+  const t=curTask(), txt=$('#tdText').value.trim(), pend=tdPick?tdPick.get().length:0; if(!t||(!txt&&!pend)) return;
+  try{
+    const row=await dbw(sb.from('task_updates').insert({task_id:t.id,user_id:myId(),text:txt||'(attachment)',kind:'note'}).select('id').single());
+    await safeUpload(tdPick,row.id); $('#tdText').value=''; tdPick=attPicker('task_update',null); $('#tdFiles').replaceChildren(tdPick.el);
+    await reload(); toast('Update posted','Notify team',()=>openShare(shareForTask(curTaskOr(t),'update',txt||'Added an attachment')));
+  }catch(e){ toast(writeErr(e)); }
+});
+const curTaskOr = t => curTask()||t;
+$('#tdNotify').addEventListener('click',()=>{ const t=curTask(); if(!t) return; const txt=$('#tdText').value.trim(); openShare(shareForTask(t,isOver(t)?'over':'update',txt||undefined)); });
+
+/* ---------- share / notify (WhatsApp, email, copy) ---------- */
+const trackerLink = () => location.href.split('#')[0];
+function shareForTask(t,kind,extra){
+  const owner=t.ownerId?pn(t.ownerId):'the owner', link='\nOpen the tracker: '+trackerLink();
+  let msg, title='Notify the team';
+  if(kind==='done') msg='✅ Task completed: "'+t.title+'"\nOwner: '+owner+'\nNile Youth Network'+link;
+  else if(kind==='over') { msg='🔴 OVERDUE: "'+t.title+'" was due '+dShort(t.due)+'.\nOwner: '+owner+'\nProgress: '+(t.progress||0)+'%. Please post an update.'+link; title='Alert the team'; }
+  else if(kind==='assigned') msg='🆕 New task: "'+t.title+'"\nOwner: '+owner+'\nDue: '+dShort(t.due)+link;
+  else msg='📌 Update on "'+t.title+'"\n'+(extra?myName()+': '+extra+'\n':'')+'Status: '+STATUS[t.status]+' · Progress: '+(t.progress||0)+'%'+link;
+  const ids=[...new Set([t.ownerId,...(t.mentions||[])].filter(Boolean))].filter(i=>i!==myId());
+  return {title,message:msg,ids,subject:'Task: '+t.title};
+}
+const shareForMeeting = m => ({title:'Share meeting',message:'📅 '+(m.kind==='event'?'Event':'Meeting')+': '+m.title+'\n'+dLong(m.date)+(m.time?' at '+m.time:'')+(m.place?'\nWhere: '+m.place:'')+(m.meetLink?'\nGoogle Meet: '+m.meetLink:'')+(m.rsvpBy?'\nPlease reply by: '+dShort(m.rsvpBy):'')+(m.agenda?'\n\nAgenda:\n'+m.agenda:'')+'\n\nSay if you can join in the tracker: '+trackerLink(),ids:activeMembers().map(p=>p.id).filter(i=>i!==myId()),subject:(m.kind==='event'?'Event: ':'Meeting: ')+m.title});
+const shareForPost = p => ({title:'Ask the team to confirm',message:'📣 Media post to confirm: '+p.title+' ('+p.platform+')\nPost date: '+dLong(p.postDate)+(p.confirmBy?'\nPlease confirm by: '+dShort(p.confirmBy):'')+(p.caption?'\n\n'+trunc(p.caption,400):'')+'\n\nConfirm in the tracker: '+trackerLink(),ids:activeMembers().map(m=>m.id).filter(i=>i!==myId()),subject:'Please confirm: '+p.title});
+const shareForMinutes = x => ({title:'Share minutes',message:'📝 Minutes: '+x.title+' ('+dShort(x.date)+')\n'+(x.decisions?'\nDecisions:\n'+x.decisions:'')+(x.actions?'\n\nAction items:\n'+x.actions:'')+'\n\nFull minutes: '+trackerLink(),ids:[],subject:'Minutes: '+x.title});
+function openShare({title,message,ids,subject}){
+  const dlg=$('#dShare'), body=$('#shareBody');
+  const emails=ids.map(i=>S.profiles[i]&&S.profiles[i].email).filter(Boolean);
+  const ta=h('textarea',{rows:7}); ta.value=message;
+  const wa=h('a',{class:'btn wa',target:'_blank',rel:'noopener'},'WhatsApp');
+  const mail=h('a',{class:'btn primary',target:'_blank',rel:'noopener'},'Email');
+  const pLinks=(ids.length<=5?ids:[]).filter(i=>S.profiles[i]&&S.profiles[i].phone).map(i=>({id:i,a:h('a',{class:'btn wa small',target:'_blank',rel:'noopener'},'WhatsApp '+pn(i).split(' ')[0])}));
+  const sync=()=>{ pLinks.forEach(x=>{ x.a.href='https://wa.me/'+S.profiles[x.id].phone.replace(/\D/g,'')+'?text='+encodeURIComponent(ta.value); });
+    wa.href='https://wa.me/?text='+encodeURIComponent(ta.value);
+    mail.href='mailto:?'+(emails.length?'bcc='+encodeURIComponent(emails.join(','))+'&':'')+'subject='+encodeURIComponent(subject||'Nile Youth Network')+'&body='+encodeURIComponent(ta.value); };
+  ta.addEventListener('input',sync); sync();
+  const copy=h('button',{class:'btn',onclick:async()=>{ try{ await navigator.clipboard.writeText(ta.value); }catch(e){ ta.select(); try{document.execCommand('copy');}catch(_){} } toast('Message copied'); }},'Copy');
+  rc(body,h('div',{class:'dlg-head'},h('h3',{text:title}),h('button',{class:'x-close','aria-label':'Close',onclick:()=>dlg.close()},'×')),
+    ids.length?h('div',{class:'field'},h('label',{text:'People to notify'}),h('div',{class:'chips'},...ids.map(i=>h('span',{class:'chip'},avatar(i,20),nm(i))))):null,
+    field('Message (you can edit it)',ta),
+    h('p',{class:'hint',text:'This opens WhatsApp or your email app with the message ready to send. People who added a WhatsApp number to their profile get their own button.'}),
+    h('div',{class:'actions'},copy,mail,wa,...pLinks.map(x=>x.a)));
+  dlg.showModal();
+}
+
+/* =====================================================================
+   DEMO MODE: runs the whole tool on in-memory sample data.
+   It switches on automatically while SUPABASE_URL / SUPABASE_ANON_KEY
+   above are still the PASTE_YOUR_... placeholders. Nothing is saved.
+   ===================================================================== */
+let DEMO=false, demoDB=null, demoPersona='chair', demoBlobs={};
+const DEMO_PERSONAS=[['chair','Chair person (admin)','u-amina'],['vice','Vice chair person','u-hanna'],['secretary','Secretary general','u-mulu'],['advocacy','Advocacy and trainer','u-abel'],['comms','Communication','u-dawit'],['treasurer','Treasurer','u-yonas'],['coordinator','Project coordinator','u-selam'],['pending','New member (not approved)','u-tigist'],['login','Sign-in screen',null]];
+function demoSeed(){
+  const day=864e5, now=Date.now(), T=n=>new Date(now+n*day).toISOString(), D=n=>iso(new Date(now+n*day));
+  let seq=0; demoBlobs={};
+  const svg=(label,bg)=>'data:image/svg+xml;utf8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200"><rect width="320" height="200" fill="'+bg+'"/><circle cx="260" cy="48" r="26" fill="rgba(255,255,255,.35)"/><path d="M0 150 Q 40 130 80 150 T 160 150 T 240 150 T 320 150 V200 H0z" fill="rgba(255,255,255,.35)"/><text x="20" y="96" font-family="Arial" font-size="22" font-weight="bold" fill="#fff">'+label+'</text></svg>');
+  const pdf=text=>URL.createObjectURL(new Blob(['%PDF-1.1\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 60>>stream\nBT /F1 16 Tf 20 100 Td ('+text+') Tj ET\nendstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF'],{type:'application/pdf'}));
+  const P=(id,name,role,active,position,training)=>({id,email:name.split(' ')[0].toLowerCase()+'@example.org',full_name:name,phone:active?'+2519110000'+String(++seq).padStart(2,'0'):'',role,active,is_comms:false,committee_position:position||'',is_training:!!training,created_at:T(-60)});
+  const profiles=[P('u-amina','Amina Bekele','admin',true,'chair'),P('u-hanna','Hanna Alemu','member',true,'vice_chair'),P('u-mulu','Mulu Kebede','admin',true,'secretary'),P('u-abel','Abel Tesfaye','member',true,'advocacy',true),P('u-dawit','Dawit Tadesse','member',true,'communication'),P('u-yonas','Yonas Girma','member',true,'treasurer'),P('u-selam','Selam Haile','member',true,'coordinator'),P('u-tigist','Tigist Worku','member',false,'')];
+  const K=(id,title,owner,due,priority,team,status,progress,x={})=>({id,title,description:x.description||'',owner_id:owner,due:D(due),priority,team,status,progress,mentions:x.mentions||[],checklist:x.checklist||[],created_by:x.by||'u-amina',created_at:T(x.created!=null?x.created:-14),updated_at:T(-1),completed_at:x.done!=null?T(x.done):null});
+  const C=(text,done)=>({id:'c'+(++seq),text,done});
+  const tasks=[
+    K('t-samples','Collect water samples at the Blue Nile sites','u-selam',-3,'high','Water quality','progress',60,{description:'Six sites, two bottles each. Label with site code and time.',mentions:['u-yonas'],checklist:[C('Check and label the kits',true),C('Visit sites 1 to 4',true),C('Visit sites 5 and 6 (needs a boat)',false)]}),
+    K('t-lab','Summarise lab results','u-yonas',6,'med','Water quality','todo',0),
+    K('t-clean','Plan the riverside clean-up day','u-hanna',5,'high','Community','progress',35,{checklist:[C('Get permission from the municipality',true),C('Order gloves and bags',false),C('Confirm 20 volunteers',false)]}),
+    K('t-volunteers','Register clean-up volunteers','u-mulu',-1,'med','Community','progress',20),
+    K('t-poster','Design school awareness poster','u-dawit',2,'high','Media','progress',70,{mentions:['u-selam','u-hanna']}),
+    K('t-guide','Translate the water-saving guide into Amharic','u-abel',9,'low','Advocacy','todo',0),
+    K('t-partner','Contact three partner schools','u-abel',7,'med','Advocacy','progress',30),
+    K('t-report','Write the quarterly progress report','u-amina',14,'med','Leadership','todo',0),
+    K('t-photo','Photo story: river communities','u-dawit',12,'low','Media','progress',15),
+    K('t-budget','Prepare the Q4 budget','u-yonas',4,'high','Finance','progress',50),
+    K('t-minutes','Type up and share last meeting minutes','u-mulu',1,'med','Secretariat','progress',80),
+    K('t-timeline','Update the project timeline','u-selam',8,'med','Projects','todo',0)
+  ];
+  const doneTitles=['Set up the team WhatsApp group','Draft the partner list','Buy sampling kits','Volunteer training day','Social media content calendar','Welcome pack for new members','Register with the local water office','Photo day at the river','School club outreach visit','Update the contact sheet','Print volunteer badges','Map the sampling sites'];
+  const doneDays=[-53,-49,-44,-41,-36,-33,-27,-24,-19,-15,-4,-0.4], owners=['u-selam','u-yonas','u-hanna','u-mulu','u-abel','u-dawit','u-amina'];
+  const upd=[]; const U=(task,user,text,kind,when)=>{ const id='x'+(++seq); upd.push({id,task_id:task,user_id:user,text,kind:kind||'note',created_at:T(when)}); return id; };
+  doneTitles.forEach((title,i)=>{ const id='t-done'+i, o=owners[i%owners.length]; tasks.push(K(id,title,o,doneDays[i]+1,'med','Admin','done',100,{created:doneDays[i]-6,done:doneDays[i]})); U(id,o,'Status changed to Done','status',doneDays[i]); });
+  const uSample=U('t-samples','u-selam','Collected 4 of 6 samples. The last two sites need a boat. Photo of site 3 attached.','note',-0.3);
+  U('t-samples','u-amina',JSON.stringify(['u-yonas']),'mention',-1.2);
+  U('t-samples','u-selam','Kits checked and labelled.','note',-2);
+  U('t-clean','u-hanna','The municipality confirmed we can use the riverside area.','note',-0.1);
+  U('t-clean','u-hanna','Progress set to 35%','status',-1);
+  U('t-poster','u-dawit','First draft is ready. Waiting for team feedback.','note',-0.5);
+  U('t-poster','u-dawit',JSON.stringify(['u-selam','u-hanna']),'mention',-0.8);
+  U('t-volunteers','u-mulu','Sign-up form shared in three groups.','note',-3);
+  U('t-budget','u-yonas','Draft budget ready. Training and events are the largest lines.','note',-0.2);
+  upd.sort((a,b)=>a.created_at.localeCompare(b.created_at));
+  const M=(id,title,kind,date,time,place,meet,by,agenda,host)=>({id,title,kind,date:D(date),time,place,meet_link:meet,rsvp_by:by==null?null:D(by),agenda,host_id:host||null,created_by:'u-amina',created_at:T(-3)});
+  const meetings=[
+    M('m1','Weekly coordination meeting','meeting',2,'10:00','','https://meet.google.com/abc-defg-hij',1,'1. Sampling progress\n2. Clean-up day plan\n3. Media calendar'),
+    M('m2','Riverside clean-up day','event',6,'08:00','Riverside meeting point','',4,'Bring gloves and water. We provide bags.'),
+    M('m3','Call with school clubs','meeting',9,'16:00','','https://meet.google.com/xyz-uvwx-rst',7,'Plan awareness sessions in schools.'),
+    M('tm1','Water sampling skills workshop','training',4,'09:00','','https://meet.google.com/tra-ining-one',2,'How to collect, label and store samples safely.','u-abel'),
+    M('tm2','Advocacy and public speaking','training',13,'14:00','Community hall','',11,'Speaking about water issues to schools and local leaders.','u-abel'),
+    M('pm1','Weekly coordination meeting','meeting',-5,'10:00','','https://meet.google.com/abc-defg-hij',null,'Sampling plan and clean-up date.'),
+    M('pm2','Volunteer briefing','meeting',-2,'17:00','Office',' ',null,'Roles for the clean-up day.'),
+    M('ptr1','First aid for volunteers','training',-10,'09:00','Health centre','',null,'Basic first aid for field work.','u-abel'),
+    M('ptr2','Social media basics','training',-25,'15:00','','',null,'Writing and scheduling posts.','u-dawit')];
+  meetings.forEach(m=>{ if(m.meet_link===' ') m.meet_link=''; });
+  const minutes=[
+    {id:'n1',title:'Weekly meeting minutes',date:D(-5),attendees:'Amina, Dawit, Selam, Yonas, Hanna',summary:'Reviewed sampling plan and the clean-up date. Media team shared the content calendar.',decisions:'Clean-up day set for next week.\nSampling visits split between Selam and Yonas.',actions:'Selam: finish site visits\nHanna: ask the municipality for permission\nDawit: poster draft',meeting_id:'pm1',created_by:'u-mulu',created_at:T(-5)},
+    {id:'n2',title:'Kick-off meeting',date:D(-12),attendees:'Everyone',summary:'Introduced the goals for the quarter and agreed roles.',decisions:'Roles agreed for the seven committee positions. Weekly meeting every Wednesday.',actions:'Everyone: set weekly goals in the tracker',meeting_id:null,created_by:'u-mulu',created_at:T(-12)}];
+  const R=(m,u,response,comment)=>({id:'r'+(++seq),meeting_id:m,user_id:u,response,comment:comment||'',updated_at:T(-1)});
+  const rsvps=[R('m1','u-selam','going'),R('m1','u-yonas','going','I will share the lab plan'),R('m1','u-hanna','maybe','Might be 15 minutes late'),R('m1','u-mulu','no','I have an exam that day'),R('m2','u-hanna','going','I can bring 5 friends'),R('tm1','u-selam','going'),R('tm1','u-mulu','going','Can I bring a colleague?'),R('ptr1','u-selam','going'),R('ptr1','u-hanna','going'),R('ptr1','u-mulu','going')];
+  const media=[
+    {id:'p1',title:'World Water Day teaser',platform:'Instagram',caption:'One river, millions of lives. Join the Nile Youth Network as we clean our riverside. Details coming soon.',link:'https://example.org/design-teaser',post_date:D(3),confirm_by:D(1),status:'awaiting',created_by:'u-dawit',created_at:T(-1)},
+    {id:'p2',title:'Volunteer call for clean-up day',platform:'Facebook',caption:'We need 30 volunteers for our riverside clean-up. Reply to join.',link:'',post_date:D(4),confirm_by:D(2),status:'awaiting',created_by:'u-dawit',created_at:T(-0.6)},
+    {id:'p3',title:'Thank you to the sampling team',platform:'Facebook',caption:'Thank you to everyone who helped collect water samples this week.',link:'',post_date:D(-4),confirm_by:D(-6),status:'published',created_by:'u-dawit',created_at:T(-8)}];
+  const CF=(p,u,response,comment)=>({id:'k'+(++seq),post_id:p,user_id:u,response,comment:comment||'',updated_at:T(-0.5)});
+  const confirms=[CF('p1','u-amina','approved'),CF('p1','u-selam','approved'),CF('p1','u-yonas','changes','Please add the date of the clean-up.'),CF('p2','u-hanna','approved'),CF('p3','u-amina','approved'),CF('p3','u-selam','approved'),CF('p3','u-hanna','approved')];
+  const wk=weekISO(); const G=(u,text,done)=>({id:'g'+(++seq),user_id:u,week_start:wk,text,done,created_at:T(-2)});
+  const goals=[G('u-selam','Finish all six sampling visits',false),G('u-selam','Send samples to the lab',false),G('u-selam','Label and store kits',true),G('u-yonas','Finish the Q4 budget draft',false),G('u-yonas','Record all receipts',true),
+    G('u-hanna','Get clean-up permission',true),G('u-hanna','Order gloves and bags',true),G('u-hanna','Confirm volunteers',false),G('u-dawit','Finish the school poster',false),G('u-dawit','Schedule three posts',true),G('u-dawit','Collect photos from the field',false),
+    G('u-mulu','Share the minutes',false),G('u-mulu','Call 10 volunteers',false),G('u-amina','Prepare the weekly meeting',true),G('u-amina','Start the quarterly report',false),G('u-abel','Prepare the sampling workshop',false)];
+  // finance
+  const FD=(mAgo,d)=>{ const x=new Date(); x.setDate(1); x.setMonth(x.getMonth()-mAgo); x.setDate(d); return iso(x); };
+  const F=(id,mAgo,d,kind,category,description,party,amount)=>({id,entry_date:FD(mAgo,d),kind,category,description,party,amount,created_by:'u-yonas',created_at:T(-mAgo*30)});
+  const fin=[F('f1',5,3,'income','Grants','Seed grant from partner organisation','Water Partners',45000),F('f2',5,12,'expense','Supplies','Sampling kits','Lab supplier',9800),F('f3',4,5,'income','Membership fees','Membership fees','Members',3200),F('f4',4,18,'expense','Training','Volunteer training day','Venue and snacks',6400),
+    F('f5',3,2,'income','Donations','Community donations','Local donors',8500),F('f6',3,10,'expense','Printing','Posters and flyers','Print shop',2300),F('f7',3,22,'expense','Transport','Field transport','Drivers',3100),
+    F('f8',2,6,'income','Membership fees','Membership fees','Members',3600),F('f9',2,14,'expense','Events','Photo day at the river','Equipment and food',5200),F('f10',2,25,'expense','Communication','Airtime and data','Team',1500),
+    F('f11',1,4,'income','Donations','Online donations','Supporters',6200),F('f12',1,13,'expense','Supplies','Gloves and bags','Hardware shop',2700),F('f13',1,21,'expense','Transport','Site visits','Drivers',2900),F('f14',0,2,'income','Membership fees','Membership fees','Members',3400),F('f15',0,5,'expense','Printing','School posters','Print shop',1800),F('f16',0,8,'expense','Events','Clean-up day planning meeting','Venue',1200)];
+  const budgets=[['Events',20000],['Training',15000],['Transport',12000],['Supplies',14000],['Printing',4000],['Communication',5000]].map(([category,amount],i)=>({id:'b'+i,category,amount}));
+  const settings=[{key:'currency',value:'ETB'}];
+  // attachments
+  const AT=[]; const A=(kind,owner,name,mime,uploader,data,link)=>{ const id='a'+(++seq); if(link) AT.push({id,owner_kind:kind,owner_id:owner,name,path:'',url:link,mime:'link',size:0,uploaded_by:uploader,created_at:T(-1)}); else { const path='demo/'+id+'-'+name; demoBlobs[path]=data; AT.push({id,owner_kind:kind,owner_id:owner,name,path,url:'',mime,size:24000,uploaded_by:uploader,created_at:T(-1)}); } };
+  A('minute','n1','Meeting photo.svg','image/svg+xml','u-mulu',svg('Weekly meeting','#1D5FD1'));
+  A('minute','n1','Meeting agenda.pdf','application/pdf','u-mulu',pdf('Meeting agenda'));
+  A('minute','n1','Meeting recording (Google Drive)','link','u-mulu',null,'https://drive.google.com/file/d/sample-recording/view');
+  A('minute','n2','Kick-off slides.pdf','application/pdf','u-mulu',pdf('Kick-off slides'));
+  A('task','t-samples','Sampling plan.pdf','application/pdf','u-selam',pdf('Sampling plan'));
+  A('task_update',uSample,'Sampling site 3.svg','image/svg+xml','u-selam',svg('Sampling site 3','#12805A'));
+  A('media_post','p1','Teaser design.svg','image/svg+xml','u-dawit',svg('World Water Day','#D6336C'));
+  A('media_post','p1','Teaser video (YouTube)','link','u-dawit',null,'https://www.youtube.com/watch?v=sample');
+  A('training_doc','d1','Water sampling manual.pdf','application/pdf','u-abel',pdf('Water sampling manual'));
+  A('training_doc','d2','Volunteer handbook.pdf','application/pdf','u-abel',pdf('Volunteer handbook'));
+  A('training_doc','d4','First aid session recording','link','u-abel',null,'https://www.youtube.com/watch?v=sample-first-aid');
+  A('transaction','f15','Print shop receipt.svg','image/svg+xml','u-yonas',svg('Receipt: printing','#E86A10'));
+  A('meeting','ptr1','First aid slides.pdf','application/pdf','u-abel',pdf('First aid slides'));
+  A('meeting','tm1','Workshop checklist.pdf','application/pdf','u-abel',pdf('Workshop checklist'));
+  const apRow=(id,area,kind,title,body,by,d)=>({id,area,kind,title,body,created_by:by,created_at:T(d),updated_at:T(d)});
+  const area_posts=[apRow('ap1','leadership','Plan','Quarterly priorities','1. Finish the water sampling round\n2. Run the riverside clean-up\n3. Recruit 20 new volunteers\n4. Publish the quarterly report','u-amina',-6),
+    apRow('ap2','secretariat','Note','Records checklist','Keep: signed attendance sheets, minutes, member list, partner letters. Update every Friday.','u-mulu',-4),
+    apRow('ap3','advocacy','Plan','School outreach plan','Visit 6 schools in 8 weeks. Each visit: 20 minute talk, a poster, and a sign-up sheet.','u-abel',-3),
+    apRow('ap4','advocacy','Draft','Partner list draft','Draft list of partner schools and clubs with contact people.','u-abel',-1),
+    apRow('ap5','projects','Plan','Project timeline Q4','Sampling (weeks 1-3), clean-up day (week 4), school sessions (weeks 5-10), report (week 12).','u-selam',-2)];
+  A('area','ap1','Quarterly priorities.pdf','application/pdf','u-amina',pdf('Quarterly priorities'));
+  A('area','ap3','Outreach schedule.pdf','application/pdf','u-abel',pdf('Outreach schedule'));
+  const dRow=(id,title,category,d,description,by)=>({id,title,category,doc_date:D(d),description,created_by:by,created_at:T(d)});
+  const training_docs=[dRow('d1','Water sampling manual','Manual',-30,'Step by step guide for collecting and storing water samples.','u-abel'),dRow('d2','Volunteer handbook','Handbook',-40,'Rules, roles and safety for volunteers.','u-abel'),dRow('d3','Social media basics slides','Slides',-25,'Slides from the social media training.','u-dawit'),dRow('d4','First aid session recording','Video',-10,'Recording of the first aid training for volunteers.','u-abel')];
+  A('training_doc','d3','Social media basics.pdf','application/pdf','u-dawit',pdf('Social media basics'));
+  return {profiles,tasks,task_updates:upd,meetings,minutes,meeting_rsvps:rsvps,media_posts:media,media_confirmations:confirms,weekly_goals:goals,attachments:AT,area_posts,training_docs,finance_entries:fin,finance_budgets:budgets,app_settings:settings};
+}
+function makeDemoClient(){
+  let seq=1000; const stamp=()=>new Date().toISOString();
+  const cascade={tasks:[['task_updates','task_id']],meetings:[['meeting_rsvps','meeting_id']],media_posts:[['media_confirmations','post_id']]};
+  const from=name=>{
+    let op='select',payload=null,filters=[],opts=null,single=false;
+    const api={ select(){return api}, order(){return api}, eq(k,v){filters.push([k,v]);return api}, single(){single=true;return api},
+      insert(r){op='insert';payload=r;return api}, update(r){op='update';payload=r;return api}, upsert(r,o){op='upsert';payload=r;opts=o;return api}, delete(){op='delete';return api},
+      then(res,rej){ return Promise.resolve(run()).then(res,rej); } };
+    function run(){
+      const rows=demoDB[name]; if(!rows) return {data:null,error:{message:'Unknown table '+name}};
+      const match=r=>filters.every(([k,v])=>r[k]===v);
+      if(op==='select') return {data:rows.filter(match).map(r=>({...r})),error:null};
+      if(op==='insert'){ const row={id:'d'+(++seq),created_at:stamp(),...payload}; rows.push(row); return {data:single?{id:row.id}:[row],error:null}; }
+      if(op==='update'){ rows.filter(match).forEach(r=>Object.assign(r,payload)); return {data:null,error:null}; }
+      if(op==='delete'){ const gone=rows.filter(match).map(r=>r.id); demoDB[name]=rows.filter(r=>!match(r)); (cascade[name]||[]).forEach(([t,c])=>{ demoDB[t]=demoDB[t].filter(r=>!gone.includes(r[c])); }); demoDB.attachments=demoDB.attachments.filter(a=>!gone.includes(a.owner_id)); return {data:null,error:null}; }
+      if(op==='upsert'){ const keys=((opts&&opts.onConflict)||'id').split(','); const ex=rows.find(r=>keys.every(k=>r[k]===payload[k])); if(ex) Object.assign(ex,payload); else rows.push({id:'d'+(++seq),...payload}); return {data:null,error:null}; }
+    }
+    return api;
+  };
+  const rpc=async(fn,a)=>{ const p=demoDB.profiles.find(x=>x.id===a.target); if(p){ if(fn==='admin_set_profile'){ p.role=a.new_role; p.active=a.new_active; } if(fn==='admin_set_position'){ p.committee_position=a.new_position; p.is_training=a.new_training; if(['chair','secretary'].includes(a.new_position)) p.role='admin'; } } return {data:null,error:null}; };
+  const nope=async()=>({data:{},error:{message:'This is demo mode. Use the "View as" menu at the top to preview each role.'}});
+  const storage={from:()=>({
+    upload:async(path,file)=>{ demoBlobs[path]=URL.createObjectURL(file); return {data:{path},error:null}; },
+    createSignedUrls:async paths=>({data:paths.map(p=>({path:p,signedUrl:demoBlobs[p]||null,error:null})),error:null}),
+    createSignedUrl:async p=>({data:{signedUrl:demoBlobs[p]},error:null}),
+    remove:async paths=>{ paths.forEach(p=>{ delete demoBlobs[p]; }); return {data:[],error:null}; } })};
+  return {from,rpc,storage,channel:()=>({on(){return this},subscribe(){return this}}),
+    auth:{getSession:async()=>({data:{session:S.session}}),onAuthStateChange:()=>({data:{subscription:{unsubscribe(){}}}}),signOut:async()=>{},signInWithPassword:nope,signUp:nope,signInWithOtp:nope}};
+}
+function demoSwitch(key){
+  demoPersona=key; const pr=DEMO_PERSONAS.find(x=>x[0]===key);
+  const prof=pr[2]?demoDB.profiles.find(p=>p.id===pr[2]):null;
+  S.session=prof?{user:{id:prof.id,email:prof.email}}:null;
+  S.view='main'; S.goalWeek=null; paintDemoBar(); startSession();
+}
+function paintDemoBar(){
+  const bar=$('#demoBar'); bar.hidden=!DEMO; if(!DEMO) return;
+  const sel=h('select',{'aria-label':'View as',onchange:e=>demoSwitch(e.target.value)},...DEMO_PERSONAS.map(([k,l])=>h('option',{value:k,text:l}))); sel.value=demoPersona;
+  bar.replaceChildren(h('div',{class:'wrap demo-in'},h('b',{text:'Demo mode'}),h('span',{class:'hint',text:'Sample data, nothing is saved. View as:'}),sel,
+    h('button',{class:'btn small ghost',onclick:()=>{ demoDB=demoSeed(); toast('Sample data reset'); demoSwitch(demoPersona); }},'Reset sample data')));
+}
+
+/* ---------- Brand images: logo and the Nile dam picture ----------
+   Put your own copies in an "assets" folder next to index.html for the most reliable result:
+     assets/logo.jpg        (the logo)
+     assets/nile-dam.jpg    (the Nile dam picture)
+   The page tries those first, then the Postimages links, then a built-in placeholder. */
+const BRAND = {
+  logo:['assets/logo.jpg','https://i.postimg.cc/MWsj8c8B/images-%281%29.jpg','https://i.postimg.cc/Y9WS6C02/images-%281%29.jpg'],
+  nav:['assets/nile-dam.jpg','https://i.postimg.cc/gYM6PwPR/images.jpg','https://i.postimg.cc/856CRzcP/images.jpg'],
+  bg:null   // optional second picture for the page background; null = reuse the nav picture
+};
+const FALLBACK_NAV='data:image/svg+xml;utf8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" preserveAspectRatio="xMidYMid slice"><defs><linearGradient id="s" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7FB2F0"/><stop offset="1" stop-color="#DCEBFA"/></linearGradient><linearGradient id="w" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2F7FD6"/><stop offset="1" stop-color="#0E4A9E"/></linearGradient></defs><rect width="640" height="360" fill="url(#s)"/><path d="M0 210 L120 150 L240 200 L330 130 L460 190 L640 120 V360 H0z" fill="#6E8F6A"/><path d="M0 240 L120 190 L260 235 L380 170 L520 225 L640 170 V360 H0z" fill="#4F7A55"/><rect x="250" y="190" width="140" height="46" fill="#B9BDC4"/><rect x="250" y="190" width="140" height="8" fill="#D5D8DE"/><path d="M0 250 Q 80 238 160 250 T 320 250 T 480 250 T 640 250 V360 H0z" fill="url(#w)"/></svg>');
+let brandLogo=null, brandImgs={nav:null,bg:null};
+const bgOn = () => { try{ return localStorage.getItem('nyn-bg')!=='off'; }catch(e){ return true; } };
+function setBg(on){ try{ localStorage.setItem('nyn-bg',on?'on':'off'); }catch(e){} paintBrand(); }
+function loadFirst(urls){
+  return new Promise(res=>{ let i=0; const next=()=>{ if(i>=urls.length) return res(null); const im=new Image(); im.onload=()=>res(urls[i]); im.onerror=()=>{ i++; next(); }; im.src=urls[i]; }; next(); });
+}
+function paintBrand(){
+  const root=document.documentElement, on=bgOn(), nav=brandImgs.nav||FALLBACK_NAV, bg=brandImgs.bg||nav;
+  root.style.setProperty('--nav-img','url("'+nav+'")'); root.style.setProperty('--bg-img','url("'+bg+'")');
+  root.classList.toggle('has-photo',on); const side=$('#side'); if(side) side.classList.toggle('photo',on);
+}
+async function loadBrand(){
+  const [logo,nav,bg]=await Promise.all([loadFirst(BRAND.logo),loadFirst(BRAND.nav),BRAND.bg?loadFirst(BRAND.bg):Promise.resolve(null)]);
+  brandLogo=logo; brandImgs={nav,bg};
+  if(logo){ const svg=document.querySelector('.brand svg'); if(svg){ const im=document.createElement('img'); im.className='logo'; im.alt='Nile Youth Network logo'; im.src=logo; svg.replaceWith(im); } }
+  paintBrand(); if(S.stage!=='app') render();
+}
+
+/* ---------- theme (light / dark) ---------- */
+const root=document.documentElement;
+const isDark=()=>(root.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'))==='dark';
+function paintThemeBtn(){ const b=$('#themeBtn'), d=isDark(); const mt=document.querySelector('meta[name="theme-color"]'); if(mt) mt.setAttribute('content',d?'#151515':'#F4F4F6'); b.textContent=d?'☀ Light':'☾ Dark'; b.setAttribute('aria-label',d?'Switch to light theme':'Switch to dark theme'); }
+try{ const sv=localStorage.getItem('nyn-theme'); if(sv==='light'||sv==='dark') root.setAttribute('data-theme',sv); }catch(e){}
+$('#themeBtn').addEventListener('click',()=>{ const next=isDark()?'light':'dark'; root.setAttribute('data-theme',next); try{localStorage.setItem('nyn-theme',next);}catch(e){} paintThemeBtn(); });
+paintThemeBtn();
+paintBrand(); loadBrand();
+try{ const mq=matchMedia('(prefers-color-scheme: dark)'); if(mq.addEventListener) mq.addEventListener('change',paintThemeBtn); }catch(e){}
+
+init();
+setInterval(()=>{ if(S.stage==='app'&&!document.hidden) render(); }, 10*60*1000);
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden&&S.stage==='app'&&Date.now()-lastFull>5*60*1000) reload(TABLES); });
+setInterval(()=>{ if(S.stage==='app'&&!document.hidden&&!rtOk&&Date.now()-lastFull>2*60*1000) reload(TABLES); }, 60*1000);
