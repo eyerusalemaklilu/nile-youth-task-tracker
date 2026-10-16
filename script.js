@@ -8,6 +8,8 @@
 const SUPABASE_URL = 'https://sqnkqhujoyexzlanaafd.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_0FND55wG8CmzdbLq_vddTA_Zp6-3y5r';
 /* ============================================================================ */
+const APP_VERSION = '2026-10-16.2';   // shown on the sign-in screen and at the bottom of the left menu, so you can tell which code is loaded
+console.info('Ethiopian Nile Youth Network task tracker, version '+APP_VERSION);
 
 /* ---------- helpers ---------- */
 const $ = (s, r=document) => r.querySelector(s);
@@ -235,6 +237,7 @@ function render(){
   const items=[];
   NAV.forEach(([label,list])=>{ const vis=list.filter(([k])=>!ADMIN_ONLY.includes(k)||S.isAdmin); if(!vis.length) return; if(label) items.push(h('div',{class:'navh',text:label}));
     vis.forEach(([k,l,acc])=>{ const b=badges[k]; items.push(h('button',{class:'acc-'+acc,'aria-current':S.view===k?'page':null,onclick:()=>go(k)},icon(k),l,(b&&b[0])?h('span',{class:'badge'+b[1],text:b[0]}):null)); }); });
+  items.push(h('div',{style:'font-size:11px;color:rgba(255,255,255,.55);padding:12px 12px 4px'},'Version '+APP_VERSION));
   nav.replaceChildren(...items);
   $('#overPill').replaceChildren(...(overdue.length?[h('button',{class:'pill-over',onclick:()=>go('main')}, h('span',{class:'pulse-dot'}), overdue.length+' overdue')]:[]));
   if (ADMIN_ONLY.includes(S.view) && !S.isAdmin) S.view='main';
@@ -267,7 +270,8 @@ function loginView(){
       h('button',{class:'btn primary',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.signInWithPassword({email:email.value.trim(),password:pw.value}); if(error) say(error.message,true); })},'Sign in'),
       h('button',{class:'btn',onclick:()=>need()&&run(async()=>{ if(pw.value.length<6){ say('Use a password of at least 6 characters.',true); return; } const {data,error}=await sb.auth.signUp({email:email.value.trim(),password:pw.value,options:{data:{full_name:name.value.trim()},emailRedirectTo:redirectUrl()}}); if(error){ say(error.message,true); return; } if(!data.session) say('Account created. Check your email to confirm it, then sign in.'); })},'Create account'),
       h('button',{class:'btn ghost',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.signInWithOtp({email:email.value.trim(),options:{emailRedirectTo:redirectUrl(),data:{full_name:name.value.trim()}}}); say(error?error.message:'Login link sent. Check your email.',!!error); })},'Email me a login link')),
-    msg);
+    msg,
+    h('p',{class:'hint',style:'margin:12px 0 0;text-align:center',text:'Version '+APP_VERSION}));
 }
 function teamView(view){
   const ppl=Object.values(S.profiles).sort((a,b)=>(a.active===b.active?0:a.active?1:-1)||pn(a.id).localeCompare(pn(b.id)));
@@ -340,7 +344,7 @@ const isImageFile = f => /^image\//.test(f.type) || /\.(jpe?g|png|gif|webp|bmp|h
 function fileProblem(f){   // returns a message if the file is not allowed, or '' if it is fine
   if(isVideoFile(f)) return '"'+f.name+'" is a video. Videos cannot be uploaded. Please share a link instead (YouTube or Google Drive): use "Add link".';
   if(isImageFile(f) && f.size>IMG_MAX) return '"'+f.name+'" is '+fmtSize(f.size)+'. Images must be '+IMG_MAX_KB+' KB or smaller to save storage. Please make the image smaller and upload it again.';
-  if(f.size>FILE_MAX) return '"'+f.name+'" is larger than 50 MB. Please upload a smaller file or share a link.';
+  if(f.size>FILE_MAX) return '"'+f.name+'" is larger than '+FILE_MAX_MB+' MB. Please upload a smaller file or share a link.';
   return '';
 }
 const urlCache = {};
@@ -428,7 +432,7 @@ function attPicker(kind,existingId){
   const lurl=h('input',{type:'text',placeholder:'https://… link to a video (YouTube, Drive) or document','aria-label':'Link address'});
   const lrow=h('div',{class:'gadd',hidden:''},lurl,h('button',{class:'btn small',type:'button',onclick:()=>{ const u=lurl.value.trim(); if(!safeLink(u)){ err.textContent='The link must start with https://'; return; } err.textContent=''; pending.push({link:u}); lurl.value=''; lrow.hidden=true; paintPend(); }},'Add'));
   paintEx();
-  const el=h('div',{class:'attpick'},exEl,pendEl,h('div',{class:'att-add'},h('button',{class:'btn small',type:'button',onclick:()=>input.click()},'Add files or photos'),h('button',{class:'btn small ghost',type:'button',onclick:()=>{ lrow.hidden=!lrow.hidden; }},'Add link'),input),lrow,err,tip,h('div',{class:'hint',text:'Images up to '+IMG_MAX_KB+' KB. Other files up to 50 MB. Videos cannot be uploaded: add a link (YouTube or Google Drive).'}));
+  const el=h('div',{class:'attpick'},exEl,pendEl,h('div',{class:'att-add'},h('button',{class:'btn small',type:'button',onclick:()=>input.click()},'Add files or photos'),h('button',{class:'btn small ghost',type:'button',onclick:()=>{ lrow.hidden=!lrow.hidden; }},'Add link'),input),lrow,err,tip,h('div',{class:'hint',text:'Images up to '+IMG_MAX_KB+' KB. Other files up to '+FILE_MAX_MB+' MB. Videos cannot be uploaded: add a link (YouTube or Google Drive).'}));
   return {el,get:()=>pending,upload:async ownerId=>{ for(const p of [...pending]){ if(p.file) await uploadFile(kind,ownerId,p.file); else await addLink(kind,ownerId,p.link); pending.splice(pending.indexOf(p),1); } }};
 }
 
