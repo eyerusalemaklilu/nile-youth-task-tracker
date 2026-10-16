@@ -1,12 +1,12 @@
-/* Nile Youth Network Task Tracker: all behavior.
+/* Ethiopian Nile Youth Network Task Tracker: all behavior.
    1) Paste your two Supabase values in the SETUP block just below.
    2) The rest of the file is the app. */
 /* ================== SETUP: paste your Supabase details here ==================
-   Leave the two PASTE_... values as they are to run the built-in DEMO with sample data.
+   Your project values are filled in below. (Put the PASTE_... text back to run the built-in DEMO with sample data.)
    Supabase dashboard -> Project Settings -> API. Both values are safe to publish:
    your data is protected by the access rules in supabase-setup.sql. */
-const SUPABASE_URL = 'PASTE_YOUR_SUPABASE_URL_HERE';
-const SUPABASE_ANON_KEY = 'PASTE_YOUR_SUPABASE_ANON_KEY_HERE';
+const SUPABASE_URL = 'https://sqnkqhujoyexzlanaafd.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_0FND55wG8CmzdbLq_vddTA_Zp6-3y5r';
 /* ============================================================================ */
 
 /* ---------- helpers ---------- */
@@ -59,7 +59,7 @@ function ago(ms){
 function toast(msg, label, fn){
   const host = $('#toastHost'); host.replaceChildren();
   const el = h('div',{class:'toast',role:'status'}, msg, label ? h('button',{onclick:()=>{host.replaceChildren(); fn&&fn();}}, label) : null);
-  host.append(el); setTimeout(()=>{ if (el.isConnected) el.remove(); }, label ? 8000 : 3500);
+  host.append(el); setTimeout(()=>{ if (el.isConnected) el.remove(); }, label ? 8000 : (msg.length>60 ? 8000 : 3500));
 }
 function writeErr(e){
   if (e && e.custom) return e.message;
@@ -260,8 +260,8 @@ function loginView(){
   const need=()=>{ if(!/.+@.+\..+/.test(email.value.trim())){ say('Enter a valid email address.',true); return false; } return true; };
   const run=async fn=>{ try{ await fn(); }catch(e){ say((e&&e.message)||'Something went wrong.',true); } };
   return h('div',{class:'panel',style:'max-width:440px;margin:30px auto'},
-    brandLogo?h('img',{class:'login-logo',src:brandLogo,alt:'Nile Youth Network logo'}):null,
-    h('h2',{style:'color:var(--navy);margin-bottom:4px',text:'Welcome'}), h('p',{class:'hint',style:'margin:0 0 14px',text:'Sign in to the Nile Youth Network task tracker.'}),
+    brandLogo?h('img',{class:'login-logo',src:brandLogo,alt:'Ethiopian Nile Youth Network logo'}):null,
+    h('h2',{style:'color:var(--navy);margin-bottom:4px',text:'Welcome'}), h('p',{class:'hint',style:'margin:0 0 14px',text:'Sign in to the Ethiopian Nile Youth Network task tracker.'}),
     field('Name',name), field('Email',email), field('Password',pw),
     h('div',{class:'actions',style:'justify-content:flex-start'},
       h('button',{class:'btn primary',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.signInWithPassword({email:email.value.trim(),password:pw.value}); if(error) say(error.message,true); })},'Sign in'),
@@ -331,7 +331,17 @@ function filterBar(){
 }
 
 /* ---------- Attachments: files, videos and links ---------- */
-const FILE_MAX = 50*1024*1024;
+const FILE_MAX = 50*1024*1024;   // documents and other files: 50 MB at most
+const IMG_MAX_KB = 784;          // photos and images: 784 KB at most (saves storage)
+const IMG_MAX = IMG_MAX_KB*1024;
+const isVideoFile = f => /^video\//.test(f.type) || /\.(mp4|mov|avi|mkv|webm|m4v|3gp|wmv|flv|mpe?g)$/i.test(f.name);
+const isImageFile = f => /^image\//.test(f.type) || /\.(jpe?g|png|gif|webp|bmp|heic|heif|tiff?)$/i.test(f.name);
+function fileProblem(f){   // returns a message if the file is not allowed, or '' if it is fine
+  if(isVideoFile(f)) return '"'+f.name+'" is a video. Videos cannot be uploaded. Please share a link instead (YouTube or Google Drive): use "Add link".';
+  if(isImageFile(f) && f.size>IMG_MAX) return '"'+f.name+'" is '+fmtSize(f.size)+'. Images must be '+IMG_MAX_KB+' KB or smaller to save storage. Please make the image smaller and upload it again.';
+  if(f.size>FILE_MAX) return '"'+f.name+'" is larger than 50 MB. Please upload a smaller file or share a link.';
+  return '';
+}
 const urlCache = {};
 const attsFor = (kind,id) => S.attachments.filter(a=>a.kind===kind && a.ownerId===String(id));
 const fmtSize = n => !n?'':n<1024?n+' B':n<1048576?Math.round(n/1024)+' KB':(n/1048576).toFixed(1)+' MB';
@@ -368,20 +378,8 @@ function attList(kind,id){
   return box;
 }
 function attCount(kind,id){ const n=attsFor(kind,id).length; return n?h('span',{class:'tag cnt',text:n+' attachment'+(n>1?'s':'')}):null; }
-async function shrinkImage(file){
-  if(!/^image\/(jpeg|png|webp)$/.test(file.type)||file.size<400*1024) return file;
-  try{
-    const bmp=await createImageBitmap(file), sc=Math.min(1,1600/Math.max(bmp.width,bmp.height));
-    const c=document.createElement('canvas'); c.width=Math.round(bmp.width*sc); c.height=Math.round(bmp.height*sc);
-    const ctx=c.getContext('2d'); ctx.fillStyle='#fff'; ctx.fillRect(0,0,c.width,c.height); ctx.drawImage(bmp,0,0,c.width,c.height);
-    const blob=await new Promise(r=>c.toBlob(r,'image/jpeg',0.82));
-    if(!blob||blob.size>=file.size) return file;
-    return new File([blob],file.name.replace(/\.\w+$/,'')+'.jpg',{type:'image/jpeg'});
-  }catch(e){ return file; }
-}
 async function uploadFile(kind,ownerId,file){
-  file=await shrinkImage(file);
-  if(file.size>FILE_MAX){ const e=new Error(file.name+' is larger than 50 MB. Add it as a link instead (Google Drive or YouTube).'); e.custom=true; throw e; }
+  const problem=fileProblem(file); if(problem){ const e=new Error(problem); e.custom=true; throw e; }
   const safe=file.name.replace(/[^\w.\-]+/g,'_').slice(-80);
   const path=myId()+'/'+kind+'/'+ownerId+'/'+Date.now().toString(36)+Math.random().toString(36).slice(2,6)+'-'+safe;
   const up=await sb.storage.from('attachments').upload(path,file,{contentType:file.type||'application/octet-stream'});
@@ -399,21 +397,25 @@ function attAdder(kind,id,label){
   const input=h('input',{type:'file',multiple:'',hidden:''});
   const busy=h('span',{class:'hint'});
   input.addEventListener('change',async()=>{
-    const files=[...input.files]; if(!files.length) return; busy.textContent='Uploading…';
-    try{ for(const f of files) await uploadFile(kind,id,f); await reload(); toast(files.length+' file'+(files.length>1?'s':'')+' added'); }catch(e){ toast(writeErr(e)); }
+    const files=[...input.files]; if(!files.length) return;
+    const ok=[], bad=[]; files.forEach(f=>{ const m=fileProblem(f); if(m) bad.push(m); else ok.push(f); });
+    if(bad.length) toast(bad[0]+(bad.length>1?' ('+(bad.length-1)+' more not added.)':''));
+    if(!ok.length){ input.value=''; return; }
+    busy.textContent='Uploading…';
+    try{ for(const f of ok) await uploadFile(kind,id,f); await reload(); if(!bad.length) toast(ok.length+' file'+(ok.length>1?'s':'')+' added'); }catch(e){ toast(writeErr(e)); }
     busy.textContent=''; input.value='';
   });
-  const lurl=h('input',{type:'text',placeholder:'https://… (video, Google Drive, document)','aria-label':'Link address'});
+  const lurl=h('input',{type:'text',placeholder:'https://… (video link, Google Drive, document)','aria-label':'Link address'});
   const lrow=h('div',{class:'gadd',hidden:''},lurl,h('button',{class:'btn small primary',type:'button',onclick:async()=>{
     const u=lurl.value.trim(); if(!safeLink(u)){ toast('The link must start with https://'); return; }
     try{ await addLink(kind,id,u); lurl.value=''; lrow.hidden=true; await reload(); toast('Link added'); }catch(e){ toast(writeErr(e)); }
   }},'Save'));
-  return h('div',{},h('div',{class:'att-add'},h('button',{class:'btn small',type:'button',onclick:()=>input.click()},label||'Add files or videos'),h('button',{class:'btn small ghost',type:'button',onclick:()=>{ lrow.hidden=!lrow.hidden; }},'Add link'),busy,input),lrow);
+  return h('div',{},h('div',{class:'att-add'},h('button',{class:'btn small',type:'button',onclick:()=>input.click()},label||'Add files or photos'),h('button',{class:'btn small ghost',type:'button',onclick:()=>{ lrow.hidden=!lrow.hidden; }},'Add link'),busy,input),lrow);
 }
 function attBlock(kind,id,label){
   const l=attList(kind,id), a=attAdder(kind,id,label);
   if(!l && !a) return null;
-  return h('div',{class:'field'},h('label',{text:'Files, photos and videos'}),l,a);
+  return h('div',{class:'field'},h('label',{text:'Files and photos'}),l,a);
 }
 function attPicker(kind,existingId){
   const pending=[];
@@ -421,11 +423,11 @@ function attPicker(kind,existingId){
   const paintEx=()=>{ const cur=existingId?attsFor(kind,existingId):[]; exEl.hidden=!cur.length; exEl.replaceChildren(...cur.map(a=>attItem(a,async x=>{ await removeAttUI(x); paintEx(); }))); if(cur.some(a=>a.path&&!urlOf(a))) ensureUrls(cur).then(paintEx); };
   const paintPend=()=>pendEl.replaceChildren(...pending.map(p=>h('span',{class:'chip'},p.file?p.file.name+' ('+fmtSize(p.file.size)+')':'Link: '+p.link,h('button',{type:'button',class:'x','aria-label':'Remove',onclick:()=>{ pending.splice(pending.indexOf(p),1); paintPend(); }},'×'))));
   const input=h('input',{type:'file',multiple:'',hidden:''});
-  input.addEventListener('change',()=>{ err.textContent=''; for(const f of input.files){ if(f.size>FILE_MAX){ err.textContent=f.name+' is larger than 50 MB. Add it as a link instead.'; continue; } if(f.type.startsWith('video/')&&f.size>20*1024*1024) tip.textContent='Tip: big videos use up your free storage. A YouTube or Google Drive link is better for long videos.'; pending.push({file:f}); } input.value=''; paintPend(); });
-  const lurl=h('input',{type:'text',placeholder:'https://… link to a video or document','aria-label':'Link address'});
+  input.addEventListener('change',()=>{ const bads=[]; for(const f of input.files){ const bad=fileProblem(f); if(bad){ bads.push(bad); continue; } pending.push({file:f}); } err.textContent=bads.join(' '); input.value=''; paintPend(); });
+  const lurl=h('input',{type:'text',placeholder:'https://… link to a video (YouTube, Drive) or document','aria-label':'Link address'});
   const lrow=h('div',{class:'gadd',hidden:''},lurl,h('button',{class:'btn small',type:'button',onclick:()=>{ const u=lurl.value.trim(); if(!safeLink(u)){ err.textContent='The link must start with https://'; return; } err.textContent=''; pending.push({link:u}); lurl.value=''; lrow.hidden=true; paintPend(); }},'Add'));
   paintEx();
-  const el=h('div',{class:'attpick'},exEl,pendEl,h('div',{class:'att-add'},h('button',{class:'btn small',type:'button',onclick:()=>input.click()},'Add files, photos or videos'),h('button',{class:'btn small ghost',type:'button',onclick:()=>{ lrow.hidden=!lrow.hidden; }},'Add link'),input),lrow,err,tip,h('div',{class:'hint',text:'Files up to 50 MB. Photos are shrunk automatically. For bigger videos, add a Google Drive or YouTube link.'}));
+  const el=h('div',{class:'attpick'},exEl,pendEl,h('div',{class:'att-add'},h('button',{class:'btn small',type:'button',onclick:()=>input.click()},'Add files or photos'),h('button',{class:'btn small ghost',type:'button',onclick:()=>{ lrow.hidden=!lrow.hidden; }},'Add link'),input),lrow,err,tip,h('div',{class:'hint',text:'Images up to '+IMG_MAX_KB+' KB. Other files up to 50 MB. Videos cannot be uploaded: add a link (YouTube or Google Drive).'}));
   return {el,get:()=>pending,upload:async ownerId=>{ for(const p of [...pending]){ if(p.file) await uploadFile(kind,ownerId,p.file); else await addLink(kind,ownerId,p.link); pending.splice(pending.indexOf(p),1); } }};
 }
 
@@ -589,7 +591,7 @@ function areaPostCard(p,acc){
   const long=(p.body||'').length>400;
   const body=p.body?(long?h('details',{},h('summary',{class:'hint',style:'cursor:pointer',text:trunc(p.body,200)}),h('p',{class:'body',text:p.body})):h('p',{class:'body',text:p.body})):null;
   return h('div',{class:'postcard acc-'+acc},h('div',{class:'rowline'},h('span',{class:'tag todo',text:p.kind}),h('span',{class:'hint',text:nm(p.createdBy)+' · '+ago(p.createdAt)})),
-    h('h4',{text:p.title}),body,attList('area',p.id),attAdder('area',p.id,'Add file or video'),
+    h('h4',{text:p.title}),body,attList('area',p.id),attAdder('area',p.id,'Add a file or photo'),
     can?h('div',{class:'rowline'},h('button',{class:'btn small ghost',onclick:()=>areaPostForm(p.area,p)},'Edit'),(mine||S.isAdmin)?confirmDel(()=>delRow('area_posts',p.id)):null):null);
 }
 function areaPostForm(area,p){
@@ -598,7 +600,7 @@ function areaPostForm(area,p){
   const title=h('input',{type:'text',value:ex?p.title:'',placeholder:'e.g. School outreach plan'});
   const body=h('textarea',{rows:6,placeholder:'Write the details here'}); body.value=ex?(p.body||''):'';
   const files=attPicker('area',ex?p.id:null);
-  openForm(ex?'Edit post':'New post · '+meta[0],[h('div',{class:'two'},field('Type',kind),field('Title',title)),field('Details',body),field('Files, photos and videos',files.el)],async()=>{
+  openForm(ex?'Edit post':'New post · '+meta[0],[h('div',{class:'two'},field('Type',kind),field('Title',title)),field('Details',body),field('Files and photos',files.el)],async()=>{
     if(!title.value.trim()){ toast('Add a title.'); return false; }
     const data={kind:kind.value,title:title.value.trim(),body:body.value.trim(),updated_at:new Date().toISOString()};
     if(ex){ await dbw(sb.from('area_posts').update(data).eq('id',p.id)); await safeUpload(files,p.id); }
@@ -619,7 +621,7 @@ function areaView(view,key){
   const ts=areaTasks(A,holders);
   view.append(h('div',{class:'panel sec acc-'+A.acc},h('div',{class:'ph'},h('h3',{text:'Tasks for '+A.label})),ts.length?ts.slice(0,12).map(taskRow):h('p',{class:'empty',text:'No tasks yet. Tasks with the team name “'+A.team+'” or owned by the people above show here.'})));
   const ps=S.areaPosts.filter(p=>p.area===key).sort((a,b)=>b.createdAt-a.createdAt);
-  view.append(h('div',{class:'panel acc-'+A.acc},h('div',{class:'ph'},h('h3',{text:'Plans, reports and files'})),ps.length?ps.map(p=>areaPostCard(p,A.acc)):h('p',{class:'empty',text:'Nothing posted yet. Add plans, reports, photos or videos with “+ New post”. Every member can add and edit files here.'})));
+  view.append(h('div',{class:'panel acc-'+A.acc},h('div',{class:'ph'},h('h3',{text:'Plans, reports and files'})),ps.length?ps.map(p=>areaPostCard(p,A.acc)):h('p',{class:'empty',text:'Nothing posted yet. Add plans, reports or photos with “+ New post”. Every member can add and edit files here.'})));
 }
 function leadershipExtras(view){
   const roster=Object.entries(POSITIONS).map(([k,l])=>{ const hs=activeMembers().filter(p=>p.position===k); return h('div',{class:'rost'+(hs.length?'':' empty-pos')},h('small',{text:l}),hs.length?hs.map(p=>h('div',{class:'rowline'},avatar(p.id,24),h('b',{text:pn(p.id)}))):h('span',{class:'hint',text:'Not assigned'})); });
@@ -663,7 +665,7 @@ function trainingView(view){
   const shown=docs.filter(d=>catF==='all'||d.category===catF);
   view.append(h('div',{class:'panel acc-orange'},h('div',{class:'ph'},h('h3',{text:'Training documents'}),h('div',{class:'sp'},cs)),
     shown.length?shown.map(d=>h('div',{class:'postcard acc-orange'},h('div',{class:'rowline'},h('span',{class:'tag progress',text:d.category}),h('span',{class:'hint',text:(d.date?dLong(d.date)+' · ':'')+'added by '+nm(d.createdBy)})),
-      h('h4',{text:d.title}),d.description?h('p',{class:'body',text:d.description}):null,attList('training_doc',d.id),attAdder('training_doc',d.id,'Add file or video'),
+      h('h4',{text:d.title}),d.description?h('p',{class:'body',text:d.description}):null,attList('training_doc',d.id),attAdder('training_doc',d.id,'Add a file or photo'),
       S.canWrite?h('div',{class:'rowline'},h('button',{class:'btn small ghost',onclick:()=>docForm(d)},'Edit'),(d.createdBy===myId()||S.canTrain||S.isAdmin)?confirmDel(()=>delRow('training_docs',d.id)):null):null)):h('p',{class:'empty',text:'No documents yet. Add manuals, slides, handouts and recordings from past trainings.'})));
 }
 function docForm(d){
@@ -673,7 +675,7 @@ function docForm(d){
   const date=h('input',{type:'date',value:ex?(d.date||''):todayStr()});
   const desc=h('textarea',{rows:4,placeholder:'What is this document about?'}); desc.value=ex?(d.description||''):'';
   const files=attPicker('training_doc',ex?d.id:null);
-  openForm(ex?'Edit document':'Add training document',[field('Title',title),h('div',{class:'two'},field('Type',cat),field('Date of training',date)),field('Description',desc),field('Files, slides and videos',files.el)],async()=>{
+  openForm(ex?'Edit document':'Add training document',[field('Title',title),h('div',{class:'two'},field('Type',cat),field('Date of training',date)),field('Description',desc),field('Files and slides',files.el)],async()=>{
     if(!title.value.trim()){ toast('Add a title.'); return false; }
     const data={title:title.value.trim(),category:cat.value,doc_date:date.value||null,description:desc.value.trim()};
     if(ex){ await dbw(sb.from('training_docs').update(data).eq('id',d.id)); await safeUpload(files,d.id); }
@@ -887,7 +889,7 @@ function mediaCard(p,compact){
   if(!compact){
     card.append(h('details',{class:'resp'},h('summary',{text:'Team responses'}),...members.map(m=>{ const c=cs.find(x=>x.userId===m.id);
       return h('div',{class:'rr'},avatar(m.id,22),h('span',{text:pn(m.id)}),h('span',{class:'tag '+(c?(c.response==='approved'?'done':'over'):'todo'),text:c?(c.response==='approved'?'Confirmed':'Wants changes'):'Waiting'}),c&&c.comment?h('span',{class:'hint',text:'“'+c.comment+'”'}):null); })));
-    { const ad=attAdder('media_post',p.id,'Add photo or video'); if(ad) card.append(ad); }
+    { const ad=attAdder('media_post',p.id,'Add a photo'); if(ad) card.append(ad); }
     if(S.canMedia) card.append(h('div',{style:'display:flex;gap:6px;flex-wrap:wrap;margin-top:10px'},
       published?h('button',{class:'btn small',onclick:()=>setPostStatus(p,'awaiting')},'Mark as not published'):h('button',{class:'btn small green',onclick:()=>setPostStatus(p,'published')},'Mark as published'),
       h('button',{class:'btn small',onclick:()=>openShare(shareForPost(p))},'Remind team'),
@@ -914,7 +916,7 @@ function postForm(p){
   const caption=h('textarea',{rows:5,placeholder:'The text of the post'}); caption.value=ex?(p.caption||''):'';
   const link=h('input',{type:'text',value:ex?(p.link||''):'',placeholder:'https://… (design, photo or document)'});
   const files=attPicker('media_post',ex?p.id:null);
-  openForm(ex?'Edit post':'New media post',[field('Title',title),h('div',{class:'two'},field('Platform',platform),field('Post date',postDate)),field('Team should confirm by',confirmBy,'Members who have not replied by this date show in red.'),field('Post text',caption),field('Link to design or draft (optional)',link),field('Photos, videos and files',files.el)],async()=>{
+  openForm(ex?'Edit post':'New media post',[field('Title',title),h('div',{class:'two'},field('Platform',platform),field('Post date',postDate)),field('Team should confirm by',confirmBy,'Members who have not replied by this date show in red.'),field('Post text',caption),field('Link to design or draft (optional)',link),field('Photos and files',files.el)],async()=>{
     if(!title.value.trim()||!postDate.value){ toast('Add a title and the post date.'); return false; }
     if(link.value.trim()&&!safeLink(link.value.trim())){ toast('The link must start with https://'); return false; }
     const data={title:title.value.trim(),platform:platform.value,post_date:postDate.value,confirm_by:confirmBy.value||null,caption:caption.value.trim(),link:link.value.trim()};
@@ -955,7 +957,7 @@ function adminView(view){
     h('div',{class:'stat s-red'},h('b',{text:over.length}),h('span',{text:'Overdue'}))));
   { const used=S.attachments.reduce((a,x)=>a+(x.size||0),0), cap=1024*1024*1024, pct=Math.min(100,Math.round(used/cap*100));
     view.append(h('div',{class:'panel sec acc-orange'},h('div',{class:'ph'},h('h3',{text:'File storage'})),h('div',{class:'bar'+(pct>80?' over':'')},h('i',{style:'width:'+pct+'%'})),
-      h('p',{class:'hint',style:'margin:8px 0 0',text:fmtSize(used)+' of about 1 GB used on the Supabase free plan ('+pct+'%). Check Project Settings in Supabase for the exact figure. Use YouTube or Drive links for long videos.'}))); }
+      h('p',{class:'hint',style:'margin:8px 0 0',text:fmtSize(used)+' of about 1 GB used on the Supabase free plan ('+pct+'%). Check Project Settings in Supabase for the exact figure. Videos can only be shared as links (YouTube or Google Drive).'}))); }
   // per person
   const people = [...new Set(T.map(t=>t.ownerId).filter(Boolean))];
   const rows = people.map(id=>{
@@ -986,7 +988,7 @@ function weeklySummary(){
   const wk=Date.now()-7*864e5, T=S.tasks;
   const done=T.filter(t=>t.status==='done'&&t.completedAt&&t.completedAt>=wk), over=T.filter(isOver), prog=T.filter(t=>t.status==='progress');
   const L=t=>'• '+t.title+(t.ownerId?' ('+pn(t.ownerId)+')':'');
-  const msg='📊 Weekly summary · Nile Youth Network\n\n✅ Completed this week ('+done.length+'):\n'+(done.map(L).join('\n')||'None')+'\n\n🔵 In progress ('+prog.length+'):\n'+(prog.map(L).join('\n')||'None')+'\n\n🔴 Overdue ('+over.length+'):\n'+(over.map(t=>L(t)+' – due '+dShort(t.due)).join('\n')||'None')+'\n\nTracker: '+trackerLink();
+  const msg='📊 Weekly summary · Ethiopian Nile Youth Network\n\n✅ Completed this week ('+done.length+'):\n'+(done.map(L).join('\n')||'None')+'\n\n🔵 In progress ('+prog.length+'):\n'+(prog.map(L).join('\n')||'None')+'\n\n🔴 Overdue ('+over.length+'):\n'+(over.map(t=>L(t)+' – due '+dShort(t.due)).join('\n')||'None')+'\n\nTracker: '+trackerLink();
   openShare({title:'Weekly summary',message:msg,ids:[...new Set(T.map(t=>t.ownerId).filter(Boolean))].filter(i=>i!==myId()),subject:'Weekly task summary'});
 }
 function exportCsv(){
@@ -1057,7 +1059,7 @@ function meetingCard(m,compact){
     body.append(h('details',{class:'resp'},h('summary',{text:'Who is joining'}),...members.map(p=>{ const r=rs.find(x=>x.userId===p.id);
       return h('div',{class:'rr'},avatar(p.id,22),h('span',{text:pn(p.id)}),h('span',{class:'tag '+(r?(r.response==='going'?'done':r.response==='maybe'?'progress':'over'):'todo'),text:r?(r.response==='going'?'Going':r.response==='maybe'?'Maybe':'Can’t go'):'No reply'}),r&&r.comment?h('span',{class:'hint',text:'“'+r.comment+'”'}):null); })));
   }
-  if(!compact){ const ad=attAdder('meeting',m.id,'Add file or video'); if(ad) body.append(ad); }
+  if(!compact){ const ad=attAdder('meeting',m.id,'Add a file or photo'); if(ad) body.append(ad); }
   body.append(h('div',{style:'display:flex;gap:6px;margin-top:8px;flex-wrap:wrap'},
     h('button',{class:'btn small',onclick:()=>openShare(shareForMeeting(m))},'Share'),
     (!compact&&(S.canSchedule||(m.kind==='training'&&S.canTrain)))?[h('button',{class:'btn small',onclick:()=>minutesForm(null,m)},'Post minutes'),h('button',{class:'btn small ghost',onclick:()=>meetingForm(m)},'Edit'),confirmDel(()=>delRow('meetings',m.id))]:null));
@@ -1081,7 +1083,7 @@ function minuteCard(x,open){
       x.summary?h('div',{},h('h5',{text:'Discussion'}),h('p',{text:x.summary})):null,
       x.decisions?h('div',{},h('h5',{text:'Decisions'}),h('p',{text:x.decisions})):null,
       x.actions?h('div',{},h('h5',{text:'Action items'}),h('p',{text:x.actions})):null,
-      h('div',{},h('h5',{text:'Attachments'}),attList('minute',x.id)||h('p',{class:'hint',text:'No attachments yet.'}),attAdder('minute',x.id,'Add file, photo or video')),
+      h('div',{},h('h5',{text:'Attachments'}),attList('minute',x.id)||h('p',{class:'hint',text:'No attachments yet.'}),attAdder('minute',x.id,'Add a file or photo')),
       h('div',{class:'hint',text:'Posted by '+nm(x.createdBy)}),
       h('div',{style:'display:flex;gap:6px;flex-wrap:wrap'},
         h('button',{class:'btn small',onclick:()=>openShare(shareForMinutes(x))},'Share'),
@@ -1129,7 +1131,7 @@ function taskForm(t, titlePrefill, teamPrefill){
     h('div',{class:'two'}, field('Owner',owner.el), field('Due date',due)),
     h('div',{class:'two'}, field('Team or workstream',[team,tdl],'Group tasks, e.g. Water quality or Advocacy.'), field('Priority',prio)),
     field('Mention people',ment.el,'They will be listed on the task so you can notify them.'),
-    field('Files, photos and videos',files.el) ];
+    field('Files and photos',files.el) ];
   openForm(ex?'Edit task':'New task',nodes,async()=>{
     if(!title.value.trim()){ title.focus(); toast('Please add a task title.'); return false; }
     if(!due.value){ due.focus(); toast('Please choose a due date so it shows on the calendar.'); return false; }
@@ -1163,7 +1165,7 @@ function meetingForm(m,forceKind){
     h('div',{class:'two'},field('Place (optional)',place),field('Members reply by',rsvpBy,'Due date for members to say if they will join.')),
     field('Led by / trainer',host.el),
     field('Agenda or topics',agenda),
-    field('Files, slides and videos',files.el)],async()=>{
+    field('Files and slides',files.el)],async()=>{
     if(!title.value.trim()||!date.value){ toast('Add a title and date.'); return false; }
     if(meet.value.trim()&&!safeLink(meet.value.trim())){ toast('The Meet link must start with https://'); return false; }
     const data={title:title.value.trim(),date:date.value,time:time.value,place:place.value.trim(),agenda:agenda.value.trim(),kind:kind.value,meet_link:meet.value.trim(),rsvp_by:rsvpBy.value||null,host_id:host.get()[0]||null};
@@ -1182,7 +1184,7 @@ function minutesForm(x, meeting){
   const dec=h('textarea',{rows:3,placeholder:'What was decided'}); dec.value=ex?(x.decisions||''):'';
   const act=h('textarea',{rows:3,placeholder:'Who does what by when (one per line)'}); act.value=ex?(x.actions||''):'';
   const files=attPicker('minute',ex?x.id:null);
-  openForm(ex?'Edit minutes':'Post meeting minutes',[h('div',{class:'two'},field('Title',title),field('Meeting date',date)),field('Attendees',att),field('Discussion',sum),field('Decisions',dec),field('Action items',act),field('Attachments: photos, documents, recordings and videos',files.el)],async()=>{
+  openForm(ex?'Edit minutes':'Post meeting minutes',[h('div',{class:'two'},field('Title',title),field('Meeting date',date)),field('Attendees',att),field('Discussion',sum),field('Decisions',dec),field('Action items',act),field('Attachments: photos and documents (for videos, add a link)',files.el)],async()=>{
     if(!title.value.trim()||!date.value){ toast('Add a title and date.'); return false; }
     const data={title:title.value.trim(),date:date.value,attendees:att.value.trim(),summary:sum.value.trim(),decisions:dec.value.trim(),actions:act.value.trim()};
     if(ex){ await dbw(sb.from('minutes').update(data).eq('id',x.id)); await safeUpload(files,x.id); }
@@ -1264,7 +1266,7 @@ function paintTask(){
     h('div',{class:'meta'}, h('span',{class:'tag '+t.status,text:STATUS[t.status]}), h('span',{class:'prio p-'+(t.priority||'med'),text:PRIO[t.priority||'med']+' priority'}),
       t.team?h('span',{class:'prio',text:t.team}):null, h('span',{},'Owner: ',t.ownerId?who(t.ownerId,22):'Unassigned'), h('span',{class:over?'red':'',text:t.due?dLong(t.due):'No due date'})),
     t.description?h('p',{style:'white-space:pre-wrap;margin:0 0 12px',text:t.description}):null,
-    attBlock('task',t.id,'Add files or videos'),
+    attBlock('task',t.id,'Add files or photos'),
     (t.mentions&&t.mentions.length)?h('div',{class:'field'},h('label',{text:'Mentioned'}),h('div',{class:'chips'},...t.mentions.map(id=>h('span',{class:'chip'},avatar(id,20),nm(id))))):null,
     h('div',{class:'field'},h('label',{},'Status'),seg),
     h('div',{class:'field'},h('label',{},'Progress ',pv),slider),
@@ -1293,7 +1295,7 @@ const trackerLink = () => location.href.split('#')[0];
 function shareForTask(t,kind,extra){
   const owner=t.ownerId?pn(t.ownerId):'the owner', link='\nOpen the tracker: '+trackerLink();
   let msg, title='Notify the team';
-  if(kind==='done') msg='✅ Task completed: "'+t.title+'"\nOwner: '+owner+'\nNile Youth Network'+link;
+  if(kind==='done') msg='✅ Task completed: "'+t.title+'"\nOwner: '+owner+'\nEthiopian Nile Youth Network'+link;
   else if(kind==='over') { msg='🔴 OVERDUE: "'+t.title+'" was due '+dShort(t.due)+'.\nOwner: '+owner+'\nProgress: '+(t.progress||0)+'%. Please post an update.'+link; title='Alert the team'; }
   else if(kind==='assigned') msg='🆕 New task: "'+t.title+'"\nOwner: '+owner+'\nDue: '+dShort(t.due)+link;
   else msg='📌 Update on "'+t.title+'"\n'+(extra?myName()+': '+extra+'\n':'')+'Status: '+STATUS[t.status]+' · Progress: '+(t.progress||0)+'%'+link;
@@ -1312,7 +1314,7 @@ function openShare({title,message,ids,subject}){
   const pLinks=(ids.length<=5?ids:[]).filter(i=>S.profiles[i]&&S.profiles[i].phone).map(i=>({id:i,a:h('a',{class:'btn wa small',target:'_blank',rel:'noopener'},'WhatsApp '+pn(i).split(' ')[0])}));
   const sync=()=>{ pLinks.forEach(x=>{ x.a.href='https://wa.me/'+S.profiles[x.id].phone.replace(/\D/g,'')+'?text='+encodeURIComponent(ta.value); });
     wa.href='https://wa.me/?text='+encodeURIComponent(ta.value);
-    mail.href='mailto:?'+(emails.length?'bcc='+encodeURIComponent(emails.join(','))+'&':'')+'subject='+encodeURIComponent(subject||'Nile Youth Network')+'&body='+encodeURIComponent(ta.value); };
+    mail.href='mailto:?'+(emails.length?'bcc='+encodeURIComponent(emails.join(','))+'&':'')+'subject='+encodeURIComponent(subject||'Ethiopian Nile Youth Network')+'&body='+encodeURIComponent(ta.value); };
   ta.addEventListener('input',sync); sync();
   const copy=h('button',{class:'btn',onclick:async()=>{ try{ await navigator.clipboard.writeText(ta.value); }catch(e){ ta.select(); try{document.execCommand('copy');}catch(_){} } toast('Message copied'); }},'Copy');
   rc(body,h('div',{class:'dlg-head'},h('h3',{text:title}),h('button',{class:'x-close','aria-label':'Close',onclick:()=>dlg.close()},'×')),
@@ -1385,7 +1387,7 @@ function demoSeed(){
   const R=(m,u,response,comment)=>({id:'r'+(++seq),meeting_id:m,user_id:u,response,comment:comment||'',updated_at:T(-1)});
   const rsvps=[R('m1','u-selam','going'),R('m1','u-yonas','going','I will share the lab plan'),R('m1','u-hanna','maybe','Might be 15 minutes late'),R('m1','u-mulu','no','I have an exam that day'),R('m2','u-hanna','going','I can bring 5 friends'),R('tm1','u-selam','going'),R('tm1','u-mulu','going','Can I bring a colleague?'),R('ptr1','u-selam','going'),R('ptr1','u-hanna','going'),R('ptr1','u-mulu','going')];
   const media=[
-    {id:'p1',title:'World Water Day teaser',platform:'Instagram',caption:'One river, millions of lives. Join the Nile Youth Network as we clean our riverside. Details coming soon.',link:'https://example.org/design-teaser',post_date:D(3),confirm_by:D(1),status:'awaiting',created_by:'u-dawit',created_at:T(-1)},
+    {id:'p1',title:'World Water Day teaser',platform:'Instagram',caption:'One river, millions of lives. Join the Ethiopian Nile Youth Network as we clean our riverside. Details coming soon.',link:'https://example.org/design-teaser',post_date:D(3),confirm_by:D(1),status:'awaiting',created_by:'u-dawit',created_at:T(-1)},
     {id:'p2',title:'Volunteer call for clean-up day',platform:'Facebook',caption:'We need 30 volunteers for our riverside clean-up. Reply to join.',link:'',post_date:D(4),confirm_by:D(2),status:'awaiting',created_by:'u-dawit',created_at:T(-0.6)},
     {id:'p3',title:'Thank you to the sampling team',platform:'Facebook',caption:'Thank you to everyone who helped collect water samples this week.',link:'',post_date:D(-4),confirm_by:D(-6),status:'published',created_by:'u-dawit',created_at:T(-8)}];
   const CF=(p,u,response,comment)=>({id:'k'+(++seq),post_id:p,user_id:u,response,comment:comment||'',updated_at:T(-0.5)});
@@ -1492,21 +1494,22 @@ function loadFirst(urls){
   return new Promise(res=>{ let i=0; const next=()=>{ if(i>=urls.length) return res(null); const im=new Image(); im.onload=()=>res(urls[i]); im.onerror=()=>{ i++; next(); }; im.src=urls[i]; }; next(); });
 }
 function paintBrand(){
-  const root=document.documentElement, on=bgOn(), nav=brandImgs.nav||FALLBACK_NAV, bg=brandImgs.bg||nav;
-  root.style.setProperty('--nav-img','url("'+nav+'")'); root.style.setProperty('--bg-img','url("'+bg+'")');
-  root.classList.toggle('has-photo',on); const side=$('#side'); if(side) side.classList.toggle('photo',on);
+  // Your real pictures are used when they load. The built-in drawing is only used in demo mode.
+  const root=document.documentElement, on=bgOn(), nav=brandImgs.nav||brandImgs.bg||(DEMO?FALLBACK_NAV:null), bg=brandImgs.bg||nav, show=on&&!!nav;
+  if(nav){ root.style.setProperty('--nav-img','url("'+nav+'")'); root.style.setProperty('--bg-img','url("'+bg+'")'); }
+  root.classList.toggle('has-photo',show); const side=$('#side'); if(side) side.classList.toggle('photo',show);
 }
 async function loadBrand(){
   const [logo,nav,bg]=await Promise.all([loadFirst(BRAND.logo),loadFirst(BRAND.nav),BRAND.bg?loadFirst(BRAND.bg):Promise.resolve(null)]);
   brandLogo=logo; brandImgs={nav,bg};
-  if(logo){ const svg=document.querySelector('.brand svg'); if(svg){ const im=document.createElement('img'); im.className='logo'; im.alt='Nile Youth Network logo'; im.src=logo; svg.replaceWith(im); } }
+  if(logo){ const svg=document.querySelector('.brand svg'); if(svg){ const im=document.createElement('img'); im.className='logo'; im.alt='Ethiopian Nile Youth Network logo'; im.src=logo; svg.replaceWith(im); } }
   paintBrand(); if(S.stage!=='app') render();
 }
 
 /* ---------- theme (light / dark) ---------- */
 const root=document.documentElement;
 const isDark=()=>(root.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'))==='dark';
-function paintThemeBtn(){ const b=$('#themeBtn'), d=isDark(); const mt=document.querySelector('meta[name="theme-color"]'); if(mt) mt.setAttribute('content',d?'#151515':'#F4F4F6'); b.textContent=d?'☀ Light':'☾ Dark'; b.setAttribute('aria-label',d?'Switch to light theme':'Switch to dark theme'); }
+function paintThemeBtn(){ const b=$('#themeBtn'), d=isDark(); const mt=document.querySelector('meta[name="theme-color"]'); if(mt) mt.setAttribute('content',d?'#151515':'#111111'); b.textContent=d?'☀ Light':'☾ Dark'; b.setAttribute('aria-label',d?'Switch to light theme':'Switch to dark theme'); }
 try{ const sv=localStorage.getItem('nyn-theme'); if(sv==='light'||sv==='dark') root.setAttribute('data-theme',sv); }catch(e){}
 $('#themeBtn').addEventListener('click',()=>{ const next=isDark()?'light':'dark'; root.setAttribute('data-theme',next); try{localStorage.setItem('nyn-theme',next);}catch(e){} paintThemeBtn(); });
 paintThemeBtn();
