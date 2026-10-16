@@ -773,7 +773,8 @@ function filterBar(){
 }
 
 /* ---------- Attachments: files, videos and links ---------- */
-const FILE_MAX = 50*1024*1024;   // documents and other files: 50 MB at most
+const FILE_MAX_MB = 1;           // documents and other files: change this number to change the limit (in MB)
+const FILE_MAX = FILE_MAX_MB*1024*1024;
 const IMG_MAX_KB = 784;          // photos and images: 784 KB at most (saves storage)
 const IMG_MAX = IMG_MAX_KB*1024;
 const isVideoFile = f => /^video\//.test(f.type) || /\.(mp4|mov|avi|mkv|webm|m4v|3gp|wmv|flv|mpe?g)$/i.test(f.name);
