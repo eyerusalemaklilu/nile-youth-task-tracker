@@ -392,3 +392,15 @@ html.has-photo .stat[class*="acc-"],html.has-photo .hero{background:color-mix(in
 .top .btn{background:var(--top-btn);color:var(--top-ink);border-color:var(--top-btn-line)}
 .top .btn.primary{background:var(--btn);border-color:var(--btn);color:var(--on-btn)}
 .top .btn:hover{border-color:var(--blue)}
+
+/* ---- password show/hide eye (sign-in screen) ---- */
+.pw-wrap{position:relative}
+.pw-wrap input{width:100%;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:9px 46px 9px 11px}
+.pw-eye{position:absolute;right:4px;top:50%;transform:translateY(-50%);width:38px;height:38px;display:inline-flex;align-items:center;justify-content:center;border:0;background:none;color:var(--muted);cursor:pointer;border-radius:8px;padding:0}
+.pw-eye:hover{color:var(--ink);background:var(--blue-soft)}
+
+/* ---- profile photo (My profile dialog) ---- */
+.photo-edit{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.photo-edit .av{border:2px solid var(--line)}
+.photo-edit .btns{display:flex;gap:8px;flex-wrap:wrap}
+img.av{background:var(--gray-soft)}
