@@ -8,7 +8,7 @@
 const SUPABASE_URL = 'https://sqnkqhujoyexzlanaafd.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_0FND55wG8CmzdbLq_vddTA_Zp6-3y5r';
 /* ============================================================================ */
-const APP_VERSION = '2026-10-22.2';   // shown on the sign-in screen and at the bottom of the left menu, so you can tell which code is loaded
+const APP_VERSION = '2026-10-22.3';   // shown on the sign-in screen and at the bottom of the left menu, so you can tell which code is loaded
 console.info('Ethiopian Nile Youth Network task tracker, version '+APP_VERSION);
 
 /* ---------- helpers ---------- */
@@ -73,7 +73,7 @@ function writeErr(e){
 let sb=null, realtimeOn=false;
 const S = { tasks:[], meetings:[], minutes:[], profiles:{}, me:null, isAdmin:false, canWrite:false,
   view:'main', calMonth:new Date(), calSel:null, filter:{person:'all',status:'all'}, q:'', team:'all',
-  stage:'boot', session:null, errMsg:'', rsvps:[], posts:[], confirms:[], goals:[], needUpdate:false, prioMine:false, goalWeek:null, canMedia:false, refocus:null, attachments:[], areaPosts:[], trainDocs:[], fin:[], budgets:[], settings:{}, finFilter:{month:'all',kind:'all',cat:'all',q:''}, docCat:'all', pos:'', canSchedule:false, canMinutes:false, canFinance:false, canTrain:false, isTrainer:false };
+  stage:'boot', session:null, errMsg:'', rsvps:[], posts:[], confirms:[], goals:[], needUpdate:false, prioMine:false, goalWeek:null, canMedia:false, refocus:null, attachments:[], areaPosts:[], trainDocs:[], fin:[], budgets:[], settings:{}, finFilter:{month:'all',kind:'all',cat:'all',q:''}, docCat:'all', pos:'', canSchedule:false, canMinutes:false, canFinance:false, canTrain:false, isTrainer:false, online:new Set() };
 const myId = () => (S.me && S.me.id) || null;
 const pn = id => { const p=S.profiles[id]; return (p&&p.name)||(p&&p.email?p.email.split('@')[0]:'')||'Team member'; };
 const myName = () => (S.me&&S.me.name)||(S.me&&S.me.email)||'A teammate';
@@ -149,7 +149,7 @@ function afterLoad(){
   S.isAdmin=p.role==='admin'&&p.active; S.canWrite=p.active; S.pos=p.position||''; const lead=['chair','vice_chair','secretary'].includes(S.pos);
   S.canSchedule=p.active&&(p.role==='admin'||lead); S.canMinutes=S.canSchedule; S.canFinance=p.active&&(p.role==='admin'||S.pos==='treasurer'); S.isTrainer=p.active&&p.isTraining; S.canTrain=p.active&&(p.role==='admin'||p.isTraining); S.canMedia=p.active&&(p.role==='admin'||p.isComms||S.pos==='communication');
   S.stage=p.active?'app':'pending';
-  render(); paintTask();
+  render(); paintTask(); if(personId) paintPerson();
 }
 /* After you save something, only the changed tables are reloaded. Other people's changes arrive live. */
 async function reload(arg){
@@ -168,9 +168,9 @@ function subscribeRealtime(){
 }
 
 async function startSession(){
-  if(!S.session){ S.stage='login'; S.me=null; S.isAdmin=false; S.canWrite=false; S.tasks=[]; S.meetings=[]; S.minutes=[]; S.profiles={}; S.rsvps=[]; S.posts=[]; S.confirms=[]; S.goals=[]; S.attachments=[]; S.areaPosts=[]; S.trainDocs=[]; S.fin=[]; S.budgets=[]; S.settings={}; S.canMedia=false; S.canSchedule=false; S.canMinutes=false; S.canFinance=false; S.canTrain=false; S.isTrainer=false; S.pos=''; render(); return; }
+  if(!S.session){ S.stage='login'; S.me=null; S.isAdmin=false; S.canWrite=false; S.tasks=[]; S.meetings=[]; S.minutes=[]; S.profiles={}; S.rsvps=[]; S.posts=[]; S.confirms=[]; S.goals=[]; S.attachments=[]; S.areaPosts=[]; S.trainDocs=[]; S.fin=[]; S.budgets=[]; S.settings={}; S.canMedia=false; S.canSchedule=false; S.canMinutes=false; S.canFinance=false; S.canTrain=false; S.isTrainer=false; S.pos=''; stopPresence(); render(); return; }
   S.me={id:S.session.user.id,email:S.session.user.email,name:''}; S.stage='boot'; render();
-  if(await loadAll()){ afterLoad(); subscribeRealtime(); }
+  if(await loadAll()){ afterLoad(); subscribeRealtime(); subscribePresence(); }
 }
 async function signOut(){ if(DEMO){ demoSwitch('login'); return; } if(sb) await sb.auth.signOut(); }
 async function init(){
@@ -802,14 +802,97 @@ function updText(u){
 }
 const PLATFORMS = ['Facebook','Instagram','X (Twitter)','LinkedIn','TikTok','YouTube','Telegram','Website / blog','Other'];
 
+
+/* ---------- Team strip (Main board banner), online status and the profile pop-up ---------- */
+Object.assign(ICONS,{
+  mail:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>',
+  phone:'<path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z"/>',
+  badge:'<rect x="3" y="7" width="18" height="13" rx="2"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M3 13h18"/>',
+  shield:'<path d="M12 3l8 3v6c0 4.5-3.2 7.5-8 9-4.8-1.5-8-4.5-8-9V6z"/><path d="M9 12l2 2 4-4"/>',
+  user:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'
+});
+const POS_ORDER=['chair','vice_chair','secretary','treasurer','advocacy','communication','coordinator'];
+const roleLabel = p => posLabel(p.position)||(p.role==='admin'?'Admin':'Member');
+const isOnline = id => S.online.has(id);
+function peopleSorted(){
+  const rank=p=>{ const i=POS_ORDER.indexOf(p.position); return i<0?99:i; };
+  return Object.values(S.profiles).filter(p=>p.active).sort((a,b)=>rank(a)-rank(b)||pn(a.id).localeCompare(pn(b.id)));
+}
+const presenceDot = id => h('span',{class:'pdot '+(isOnline(id)?'on':'off'),title:isOnline(id)?'Online':'Offline'});
+function peopleStrip(){
+  const wrap=h('div',{class:'pstrip',id:'peopleStrip','aria-label':'Team members: press a person to see their profile'});
+  const paint=()=>wrap.replaceChildren(...peopleSorted().map(p=>
+    h('button',{type:'button',class:'pbtn','aria-label':pn(p.id)+', '+roleLabel(p)+', '+(isOnline(p.id)?'online':'offline'),onclick:()=>openPerson(p.id)},
+      h('span',{class:'pav'},avatar(p.id,52),presenceDot(p.id)),
+      h('span',{class:'pname',text:p.id===myId()?'You':(pn(p.id).split(' ')[0]||pn(p.id))}),
+      h('span',{class:'ppos',text:roleLabel(p)}))));
+  paint(); wrap._paint=paint; return wrap;
+}
+let personId=null;
+function openPerson(id){
+  personId=id; let dlg=$('#dPerson');
+  if(!dlg){
+    dlg=h('dialog',{id:'dPerson','aria-label':'Team member profile'},h('div',{id:'personBody',class:'person'}));
+    dlg.addEventListener('click',e=>{ if(e.target===dlg) dlg.close(); });
+    dlg.addEventListener('close',()=>{ personId=null; });
+    document.body.append(dlg);
+  }
+  paintPerson(); if(!dlg.open) dlg.showModal();
+}
+function paintPerson(){
+  const id=personId, p=S.profiles[id], body=$('#personBody'); if(!p||!body) return;
+  const keep=body.scrollTop, me=id===myId(), on=isOnline(id);
+  const open=S.tasks.filter(t=>t.ownerId===id&&t.status!=='done').sort((a,b)=>((+!!isOver(b))-(+!!isOver(a)))||byDue(a,b));
+  const row=(acc,ic,label,node)=>h('div',{class:'prow'},h('span',{class:'pico acc-'+acc},icon(ic)),h('div',{class:'pval'},h('small',{text:label}),node));
+  const digits=(p.phone||'').replace(/[^\d+]/g,'');
+  const acts=[];
+  if(me) acts.push(h('button',{class:'btn primary',type:'button',onclick:()=>{ $('#dPerson').close(); $('#userBtn').click(); }},'Edit my profile'));
+  else{
+    if(digits) acts.push(h('a',{class:'btn wa',href:'https://wa.me/'+digits.replace(/\D/g,''),target:'_blank',rel:'noopener'},'WhatsApp'));
+    if(p.email) acts.push(h('a',{class:'btn',href:'mailto:'+p.email},'Email'));
+  }
+  body.replaceChildren(
+    h('div',{class:'cover'}),
+    h('button',{class:'xb',type:'button','aria-label':'Close',onclick:()=>$('#dPerson').close()},'×'),
+    h('div',{class:'phead'},
+      h('div',{class:'big'},avatar(id,92),presenceDot(id)),
+      h('h3',{text:pn(id)+(me?' (you)':'')}),
+      h('div',{class:'pchips'},h('span',{class:'chip'},icon('badge'),roleLabel(p)),h('span',{class:'pstatus '+(on?'on':'off'),text:on?'Online now':'Offline'}))),
+    h('div',{class:'pbody'},
+      acts.length?h('div',{class:'pacts'},acts):null,
+      row('blue','user','Full name',h('b',{text:pn(id)})),
+      row('purple','mail','Email',p.email?h('a',{href:'mailto:'+p.email,text:p.email}):h('span',{class:'hint',text:'Not added'})),
+      row('green','phone','Phone',digits?h('a',{href:'tel:'+digits,text:p.phone}):h('span',{class:'hint',text:'Not added'})),
+      row('amber','badge','Position',h('b',{text:posLabel(p.position)||'No committee position'})),
+      row('teal','shield','Member type',h('b',{text:p.role==='admin'?'Admin':'Member'})),
+      h('div',{class:'psec'},h('span',{text:'Currently assigned'}),h('span',{text:open.length?open.length+' open':''})),
+      ...(open.length?open.slice(0,3).map(t=>h('button',{type:'button',class:'ptask'+(isOver(t)?' over':''),onclick:()=>{ $('#dPerson').close(); openTask(t.id); }},
+          h('span',{class:'tag '+(isOver(t)?'over':t.status),text:isOver(t)?'Overdue':STATUS[t.status]}),
+          h('b',{text:t.title}),
+          h('div',{class:'bar'},h('i',{style:'width:'+(t.progress||0)+'%'})),
+          h('div',{class:'hint',style:'margin-top:4px',text:dueLabel(t)+(t.progress?' · '+t.progress+'%':'')}))):[h('p',{class:'hint',style:'margin:0',text:'No open tasks assigned right now.'})]),
+      open.length>3?h('p',{class:'hint',style:'margin:2px 0 0',text:'+ '+(open.length-3)+' more open task'+(open.length-3>1?'s':'')}):null));
+  body.scrollTop=keep;
+}
+/* who is online = who has the app open right now (Supabase Realtime presence: no database table needed) */
+let presCh=null;
+function paintPresence(){ const el=document.getElementById('peopleStrip'); if(el&&el._paint) el._paint(); if(personId) paintPerson(); }
+function subscribePresence(){
+  if(presCh||!sb||!myId()) return;
+  if(DEMO){ presCh={}; const ids=Object.keys(S.profiles); S.online=new Set(ids.filter((x,i)=>x===myId()||i%2===0)); paintPresence(); return; }
+  presCh=sb.channel('nyn-presence',{config:{presence:{key:myId()}}});
+  presCh.on('presence',{event:'sync'},()=>{ S.online=new Set(Object.keys(presCh.presenceState())); paintPresence(); });
+  presCh.subscribe(async st=>{ if(st==='SUBSCRIBED'){ try{ await presCh.track({at:Date.now()}); }catch(e){} } });
+}
+function stopPresence(){ if(presCh&&sb){ try{ sb.removeChannel(presCh); }catch(e){} } presCh=null; S.online=new Set(); }
+
 /* ---------- Main board ---------- */
 function mainView(view, overdue){
   const T=S.tasks, me=myId(), today=todayStr();
   const avg=T.length?Math.round(T.reduce((a,t)=>a+(t.status==='done'?100:(t.progress||0)),0)/T.length):0;
   const wk=Date.now()-7*864e5, doneWk=T.filter(t=>t.completedAt&&t.completedAt>=wk).length;
-  const first=(S.me&&S.me.name)?S.me.name.split(' ')[0]:'';
   view.append(
-    h('div',{class:'page-head'},h('div',{},h('h2',{text:greeting()+(first?', '+first:'')}),h('p',{text:'Main board · '+dLong(today)}))),
+    h('div',{class:'page-head people-head'},h('p',{class:'ph-date',text:'Main board · '+dLong(today)}),peopleStrip()),
     h('div',{class:'stats'},
       h('div',{class:'stat acc-blue'},h('b',{text:avg+'%'}),h('span',{text:'Overall progress'}),h('div',{class:'bar',style:'margin-top:8px'},h('i',{style:'width:'+avg+'%'}))),
       h('div',{class:'stat acc-purple'},h('b',{text:T.filter(t=>t.status!=='done').length}),h('span',{text:'Open tasks'})),
