@@ -8,7 +8,8 @@
 const SUPABASE_URL = 'https://sqnkqhujoyexzlanaafd.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_0FND55wG8CmzdbLq_vddTA_Zp6-3y5r';
 /* ============================================================================ */
-const APP_VERSION = '2026-10-22.3';   // shown on the sign-in screen and at the bottom of the left menu, so you can tell which code is loaded
+const APP_VERSION = '2026-10-22.5';
+let RECOVERY = /type=recovery/.test(location.hash+location.search);   // true when the person opened a 'reset password' email link   // shown on the sign-in screen and at the bottom of the left menu, so you can tell which code is loaded
 console.info('Ethiopian Nile Youth Network task tracker, version '+APP_VERSION);
 
 /* ---------- helpers ---------- */
@@ -169,7 +170,9 @@ function subscribeRealtime(){
 
 async function startSession(){
   if(!S.session){ S.stage='login'; S.me=null; S.isAdmin=false; S.canWrite=false; S.tasks=[]; S.meetings=[]; S.minutes=[]; S.profiles={}; S.rsvps=[]; S.posts=[]; S.confirms=[]; S.goals=[]; S.attachments=[]; S.areaPosts=[]; S.trainDocs=[]; S.fin=[]; S.budgets=[]; S.settings={}; S.canMedia=false; S.canSchedule=false; S.canMinutes=false; S.canFinance=false; S.canTrain=false; S.isTrainer=false; S.pos=''; stopPresence(); render(); return; }
-  S.me={id:S.session.user.id,email:S.session.user.email,name:''}; S.stage='boot'; render();
+  S.me={id:S.session.user.id,email:S.session.user.email,name:''};
+  if(RECOVERY){ S.stage='recovery'; render(); return; }   // opened from a reset-password email: ask for the new password first
+  S.stage='boot'; render();
   if(await loadAll()){ afterLoad(); subscribeRealtime(); subscribePresence(); }
 }
 async function signOut(){ if(DEMO){ demoSwitch('login'); return; } if(sb) await sb.auth.signOut(); }
@@ -179,7 +182,7 @@ async function init(){
   if(!window.supabase){ S.stage='error'; S.errMsg='The Supabase library could not load. Check your internet connection and refresh.'; render(); return; }
   sb=window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY); trackWrites(sb);
   try{ const {data}=await sb.auth.getSession(); S.session=data.session; }catch(e){ S.session=null; }
-  sb.auth.onAuthStateChange((ev,session)=>{ const had=!!S.session; S.session=session; if(!!session!==had) setTimeout(startSession,0); });
+  sb.auth.onAuthStateChange((ev,session)=>{ if(ev==='PASSWORD_RECOVERY') RECOVERY=true; const had=!!S.session; S.session=session; if(ev==='PASSWORD_RECOVERY'&&had) setTimeout(startSession,0); if(!!session!==had) setTimeout(startSession,0); });
   await startSession();
 }
 
@@ -237,7 +240,7 @@ const NAV = [
 const ADMIN_ONLY = ['admin','team'];
 function render(){
   const view=$('#view'), nav=$('#nav'), inApp=S.stage==='app';
-  const ub=$('#userBtn'); ub.hidden=!S.session; if(S.session){ const label=(S.me&&(S.me.name||S.me.email))||'Account'; ub.replaceChildren(...(S.profiles[myId()]?[avatar(myId(),22)]:[]),label); }
+  const ub=$('#userBtn'); ub.hidden=!S.session; if(S.session){ const label=(S.me&&(S.me.name||S.me.email))||'Account'; ub.replaceChildren(...(S.profiles[myId()]?[avatar(myId(),28)]:[]),label); }
   $('#newTaskTop').hidden=!(inApp&&S.canWrite);
   $('#side').hidden=!inApp; document.querySelector('.layout').classList.toggle('nosid',!inApp);
   if(!inApp){ nav.replaceChildren(); $('#overPill').replaceChildren(); view.replaceChildren(gateView()); return; }
@@ -261,26 +264,65 @@ function render(){
 }
 function gateView(){
   if(S.stage==='setup') return h('div',{class:'panel',style:'max-width:560px;margin:30px auto'},h('h3',{text:'Connect your Supabase project'}),h('p',{text:'Open index.html and paste your Supabase Project URL and anon key at the top of the script (look for SETUP). The README explains every step.'}));
+  if(S.stage==='recovery') return recoveryView();
   if(S.stage==='boot') return h('p',{class:'empty',text:'Loading the team board…'});
   if(S.stage==='error') return h('div',{class:'panel',style:'max-width:560px;margin:30px auto'},h('h3',{text:'Something needs attention'}),h('p',{text:S.errMsg}),S.session?h('button',{class:'btn',onclick:signOut},'Sign out'):null);
   if(S.stage==='pending') return h('div',{class:'panel',style:'max-width:560px;margin:30px auto'},h('h3',{text:'Waiting for approval'}),h('p',{text:'Your account is created. An admin must approve it before you can see the team board. Ask them to open the Team tab and approve '+((S.me&&S.me.email)||'your email')+'.'}),h('div',{class:'actions',style:'justify-content:flex-start'},h('button',{class:'btn',onclick:reload},'Check again'),h('button',{class:'btn',onclick:signOut},'Sign out')));
   return loginView();
 }
-function loginView(){
-  const name=h('input',{type:'text',placeholder:'Your name (for new accounts)',autocomplete:'name'});
-  const email=h('input',{type:'text',placeholder:'you@example.com',autocomplete:'email',inputmode:'email'});
-  const pw=h('input',{type:'password',placeholder:'Password (at least 6 characters)',autocomplete:'current-password'});
-  const EYE='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
-  const EYE_OFF='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.9 17.9A10.7 10.7 0 0 1 12 19c-6.4 0-10-7-10-7a18.5 18.5 0 0 1 5.1-5.9M9.9 5.2A10 10 0 0 1 12 5c6.4 0 10 7 10 7a18.6 18.6 0 0 1-2.2 3.2M1 1l22 22"/><path d="M14.1 14.1a3 3 0 1 1-4.2-4.2"/></svg>';
+const EYE='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.9 17.9A10.7 10.7 0 0 1 12 19c-6.4 0-10-7-10-7a18.5 18.5 0 0 1 5.1-5.9M9.9 5.2A10 10 0 0 1 12 5c6.4 0 10 7 10 7a18.6 18.6 0 0 1-2.2 3.2M1 1l22 22"/><path d="M14.1 14.1a3 3 0 1 1-4.2-4.2"/></svg>';
+/* a password box with the show/hide eye */
+function pwField(placeholder,autocomplete){
+  const input=h('input',{type:'password',placeholder,autocomplete});
   const eye=h('button',{type:'button',class:'pw-eye','aria-label':'Show password','aria-pressed':'false',title:'Show password'});
   eye.innerHTML=EYE;
   eye.addEventListener('click',()=>{
-    const show=pw.type==='password'; pw.type=show?'text':'password';
+    const show=input.type==='password'; input.type=show?'text':'password';
     eye.innerHTML=show?EYE_OFF:EYE; eye.setAttribute('aria-pressed',show?'true':'false');
     const t=show?'Hide password':'Show password'; eye.setAttribute('aria-label',t); eye.title=t;
-    pw.focus(); try{ pw.setSelectionRange(pw.value.length,pw.value.length); }catch(e){}
+    input.focus(); try{ input.setSelectionRange(input.value.length,input.value.length); }catch(e){}
   });
-  const pwBox=h('div',{class:'pw-wrap'},pw,eye);
+  return {input,box:h('div',{class:'pw-wrap'},input,eye)};
+}
+/* plain-language messages for sign-in problems */
+function authMsg(e){
+  const m=(e&&e.message)||'';
+  if((e&&e.status===429)||/rate limit|too many|security purposes/i.test(m)) return 'Too many emails were requested. Please wait a few minutes (up to an hour) and try again, or sign in with your password.';
+  if(/redirect/i.test(m)) return 'This website address is not allowed in Supabase yet. Add it under Authentication > URL Configuration.';
+  if(/invalid login/i.test(m)) return 'Wrong email or password. If you forgot it, press "Forgot password?".';
+  if(/not confirmed/i.test(m)) return 'Please confirm your email first: open the link we sent you.';
+  if(/fetch|network/i.test(m)) return 'Could not reach the server. Check your internet connection and try again.';
+  return m||'Something went wrong. Please try again.';
+}
+/* shown after someone opens the link in a "reset password" email */
+function recoveryView(){
+  const a=pwField('New password (at least 6 characters)','new-password'), b=pwField('Repeat the new password','new-password');
+  const msg=h('div',{class:'hint',role:'status',style:'min-height:20px;margin-top:8px'});
+  const say=(t,bad)=>{ msg.textContent=t; msg.className=bad?'red':'hint'; };
+  const save=h('button',{class:'btn primary',onclick:async()=>{
+    if(a.input.value.length<6){ say('Use a password of at least 6 characters.',true); return; }
+    if(a.input.value!==b.input.value){ say('The two passwords do not match.',true); return; }
+    save.disabled=true;
+    try{
+      const {error}=await sb.auth.updateUser({password:a.input.value});
+      if(error){ say(authMsg(error),true); save.disabled=false; return; }
+      RECOVERY=false; try{ history.replaceState(null,'',location.pathname); }catch(e){}
+      toast('Password changed. You are signed in.'); startSession();
+    }catch(e){ say(authMsg(e),true); save.disabled=false; }
+  }},'Save new password');
+  return h('div',{class:'panel',style:'max-width:440px;margin:30px auto'},
+    brandLogo?h('img',{class:'login-logo',src:brandLogo,alt:'Ethiopian Nile Youth Network logo'}):null,
+    h('h2',{style:'color:var(--navy);margin-bottom:4px',text:'Choose a new password'}),
+    h('p',{class:'hint',style:'margin:0 0 14px',text:'Type the new password you want to use to sign in.'}),
+    field('New password',a.box), field('Repeat password',b.box),
+    h('div',{class:'actions',style:'justify-content:flex-start'},save,h('button',{class:'btn ghost',onclick:()=>{ RECOVERY=false; signOut(); }},'Cancel')),
+    msg);
+}
+function loginView(){
+  const name=h('input',{type:'text',placeholder:'Your name (for new accounts)',autocomplete:'name'});
+  const email=h('input',{type:'text',placeholder:'you@example.com',autocomplete:'email',inputmode:'email'});
+  const {input:pw,box:pwBox}=pwField('Password (at least 6 characters)','current-password');
   const msg=h('div',{class:'hint',role:'status',style:'min-height:20px;margin-top:8px'});
   const say=(t,bad)=>{ msg.textContent=t; msg.className=bad?'red':'hint'; };
   const need=()=>{ if(!/.+@.+\..+/.test(email.value.trim())){ say('Enter a valid email address.',true); return false; } return true; };
@@ -289,10 +331,11 @@ function loginView(){
     brandLogo?h('img',{class:'login-logo',src:brandLogo,alt:'Ethiopian Nile Youth Network logo'}):null,
     h('h2',{style:'color:var(--navy);margin-bottom:4px',text:'Welcome'}), h('p',{class:'hint',style:'margin:0 0 14px',text:'Sign in to the Ethiopian Nile Youth Network task tracker.'}),
     field('Name',name), field('Email',email), field('Password',pwBox),
+    h('div',{style:'text-align:right;margin:-6px 0 8px'},h('button',{class:'btn small ghost',type:'button',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.resetPasswordForEmail(email.value.trim(),{redirectTo:redirectUrl()}); say(error?authMsg(error):'Password reset link sent to '+email.value.trim()+'. Open it (check the spam folder too) and choose a new password.',!!error); })},'Forgot password?')),
     h('div',{class:'actions',style:'justify-content:flex-start'},
-      h('button',{class:'btn primary',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.signInWithPassword({email:email.value.trim(),password:pw.value}); if(error) say(error.message,true); })},'Sign in'),
-      h('button',{class:'btn',onclick:()=>need()&&run(async()=>{ if(pw.value.length<6){ say('Use a password of at least 6 characters.',true); return; } const {data,error}=await sb.auth.signUp({email:email.value.trim(),password:pw.value,options:{data:{full_name:name.value.trim()},emailRedirectTo:redirectUrl()}}); if(error){ say(error.message,true); return; } if(!data.session) say('Account created. Check your email to confirm it, then sign in.'); })},'Create account'),
-      h('button',{class:'btn ghost',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.signInWithOtp({email:email.value.trim(),options:{emailRedirectTo:redirectUrl(),data:{full_name:name.value.trim()}}}); say(error?error.message:'Login link sent. Check your email.',!!error); })},'Email me a login link')),
+      h('button',{class:'btn primary',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.signInWithPassword({email:email.value.trim(),password:pw.value}); if(error) say(authMsg(error),true); })},'Sign in'),
+      h('button',{class:'btn',onclick:()=>need()&&run(async()=>{ if(pw.value.length<6){ say('Use a password of at least 6 characters.',true); return; } const {data,error}=await sb.auth.signUp({email:email.value.trim(),password:pw.value,options:{data:{full_name:name.value.trim()},emailRedirectTo:redirectUrl()}}); if(error){ say(authMsg(error),true); return; } if(!data.session) say('Account created. Check your email to confirm it, then sign in.'); })},'Create account'),
+      h('button',{class:'btn ghost',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.signInWithOtp({email:email.value.trim(),options:{emailRedirectTo:redirectUrl(),data:{full_name:name.value.trim()}}}); say(error?authMsg(error):'Login link sent to '+email.value.trim()+'. Open it on this same device (check the spam folder too).',!!error); })},'Email me a login link')),
     msg,
     h('p',{class:'hint',style:'margin:12px 0 0;text-align:center',text:'Version '+APP_VERSION}));
 }
@@ -823,7 +866,7 @@ function peopleStrip(){
   const wrap=h('div',{class:'pstrip',id:'peopleStrip','aria-label':'Team members: press a person to see their profile'});
   const paint=()=>wrap.replaceChildren(...peopleSorted().map(p=>
     h('button',{type:'button',class:'pbtn','aria-label':pn(p.id)+', '+roleLabel(p)+', '+(isOnline(p.id)?'online':'offline'),onclick:()=>openPerson(p.id)},
-      h('span',{class:'pav'},avatar(p.id,52),presenceDot(p.id)),
+      h('span',{class:'pav'},avatar(p.id,68),presenceDot(p.id)),
       h('span',{class:'pname',text:p.id===myId()?'You':(pn(p.id).split(' ')[0]||pn(p.id))}),
       h('span',{class:'ppos',text:roleLabel(p)}))));
   paint(); wrap._paint=paint; return wrap;
@@ -1645,7 +1688,7 @@ function makeDemoClient(){
     getPublicUrl:p=>({data:{publicUrl:demoBlobs[p]||''}}),
     remove:async paths=>{ paths.forEach(p=>{ delete demoBlobs[p]; }); return {data:[],error:null}; } })};
   return {from,rpc,storage,channel:()=>({on(){return this},subscribe(){return this}}),
-    auth:{getSession:async()=>({data:{session:S.session}}),onAuthStateChange:()=>({data:{subscription:{unsubscribe(){}}}}),signOut:async()=>{},signInWithPassword:nope,signUp:nope,signInWithOtp:nope}};
+    auth:{getSession:async()=>({data:{session:S.session}}),onAuthStateChange:()=>({data:{subscription:{unsubscribe(){}}}}),signOut:async()=>{},signInWithPassword:nope,signUp:nope,signInWithOtp:nope,resetPasswordForEmail:nope,updateUser:nope}};
 }
 function demoSwitch(key){
   demoPersona=key; const pr=DEMO_PERSONAS.find(x=>x[0]===key);
