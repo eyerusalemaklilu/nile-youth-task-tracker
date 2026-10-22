@@ -402,6 +402,18 @@ html.has-photo .stat[class*="acc-"],html.has-photo .hero{background:color-mix(in
 .top .btn{background:var(--top-btn);color:var(--top-ink);border-color:var(--top-btn-line)}
 .top .btn.primary{background:var(--btn);border-color:var(--btn);color:var(--on-btn)}
 .top .btn:hover{border-color:var(--blue)}
+
+/* ---- password show/hide eye (sign-in screen) ---- */
+.pw-wrap{position:relative}
+.pw-wrap input{width:100%;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:9px 46px 9px 11px}
+.pw-eye{position:absolute;right:4px;top:50%;transform:translateY(-50%);width:38px;height:38px;display:inline-flex;align-items:center;justify-content:center;border:0;background:none;color:var(--muted);cursor:pointer;border-radius:8px;padding:0}
+.pw-eye:hover{color:var(--ink);background:var(--blue-soft)}
+
+/* ---- profile photo (My profile dialog) ---- */
+.photo-edit{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.photo-edit .av{border:2px solid var(--line)}
+.photo-edit .btns{display:flex;gap:8px;flex-wrap:wrap}
+img.av{background:var(--gray-soft)}
 </style>
 </head>
 <body>
@@ -439,7 +451,6 @@ html.has-photo .stat[class*="acc-"],html.has-photo .hero{background:color-mix(in
 <dialog id="dForm"><div class="dlg-in" id="formBody"></div></dialog>
 <dialog id="dShare"><div class="dlg-in" id="shareBody"></div></dialog>
 <div id="toastHost"></div>
-
 <script>/* Ethiopian Nile Youth Network Task Tracker: all behavior.
    1) Paste your two Supabase values in the SETUP block just below.
    2) The rest of the file is the app. */
@@ -450,7 +461,7 @@ html.has-photo .stat[class*="acc-"],html.has-photo .hero{background:color-mix(in
 const SUPABASE_URL = 'https://sqnkqhujoyexzlanaafd.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_0FND55wG8CmzdbLq_vddTA_Zp6-3y5r';
 /* ============================================================================ */
-const APP_VERSION = '2026-10-16.2';   // shown on the sign-in screen and at the bottom of the left menu, so you can tell which code is loaded
+const APP_VERSION = '2026-10-22.2';   // shown on the sign-in screen and at the bottom of the left menu, so you can tell which code is loaded
 console.info('Ethiopian Nile Youth Network task tracker, version '+APP_VERSION);
 
 /* ---------- helpers ---------- */
@@ -520,8 +531,20 @@ const myId = () => (S.me && S.me.id) || null;
 const pn = id => { const p=S.profiles[id]; return (p&&p.name)||(p&&p.email?p.email.split('@')[0]:'')||'Team member'; };
 const myName = () => (S.me&&S.me.name)||(S.me&&S.me.email)||'A teammate';
 function nm(id){ if(!id) return 'Someone'; if(id===myId()) return 'You'; return pn(id); }
+/* profile photos live in the public 'avatars' storage bucket; the profile row keeps only the file path */
+const avUrlCache={};
+function avatarSrc(path){
+  if(!path||!sb) return '';
+  if(!(path in avUrlCache)){ try{ avUrlCache[path]=sb.storage.from('avatars').getPublicUrl(path).data.publicUrl||''; }catch(e){ avUrlCache[path]=''; } }
+  return avUrlCache[path];
+}
 function avatar(id,size=24){
-  return h('span',{class:'av ini',style:'width:'+size+'px;height:'+size+'px;font-size:'+Math.round(size*.45)+'px',text:(pn(id)[0]||'?').toUpperCase()});
+  const p=S.profiles[id], src=p?avatarSrc(p.avatarPath):'', box='width:'+size+'px;height:'+size+'px;';
+  const initial=()=>h('span',{class:'av ini',style:box+'font-size:'+Math.round(size*.45)+'px',text:(pn(id)[0]||'?').toUpperCase()});
+  if(!src) return initial();
+  const img=h('img',{class:'av',style:box,src,alt:'',loading:'lazy'});
+  img.addEventListener('error',()=>{ if(img.isConnected) img.replaceWith(initial()); });   // broken or deleted photo: show the letter again
+  return img;
 }
 const who = (id,size=22) => h('span',{class:'who'}, avatar(id,size), nm(id));
 
@@ -555,7 +578,7 @@ const loadAll = () => loadTables(TABLES);
 function rebuild(){
   const rows=t=>RAW[t]||[], tms_=tms;
   S.needUpdate=TABLES.filter(t=>!CORE.includes(t)).some(t=>TBL_ERR[t]);
-  S.profiles={}; rows('profiles').forEach(p=>{ S.profiles[p.id]={id:p.id,name:p.full_name||'',email:p.email||'',phone:p.phone||'',role:p.role,active:!!p.active,isComms:!!p.is_comms,position:p.committee_position||'',isTraining:!!p.is_training}; });
+  S.profiles={}; rows('profiles').forEach(p=>{ S.profiles[p.id]={id:p.id,name:p.full_name||'',email:p.email||'',phone:p.phone||'',role:p.role,active:!!p.active,isComms:!!p.is_comms,position:p.committee_position||'',isTraining:!!p.is_training,avatarPath:p.avatar_path||''}; });
   const ups={}; rows('task_updates').forEach(u=>{ (ups[u.task_id]=ups[u.task_id]||[]).push({id:u.id,by:u.user_id,at:tms_(u.created_at),text:u.text,kind:u.kind}); });
   S.tasks=rows('tasks').map(r=>({id:r.id,title:r.title,description:r.description||'',ownerId:r.owner_id,due:r.due||'',priority:r.priority,team:r.team||'',status:r.status,progress:r.progress||0,mentions:r.mentions||[],checklist:r.checklist||[],updates:ups[r.id]||[],createdBy:r.created_by,createdAt:tms_(r.created_at),completedAt:tms_(r.completed_at),updatedAt:tms_(r.updated_at)}));
   S.meetings=rows('meetings').map(r=>({id:r.id,title:r.title,date:r.date,time:r.time||'',place:r.place||'',agenda:r.agenda||'',kind:r.kind||'meeting',meetLink:r.meet_link||'',rsvpBy:r.rsvp_by||'',hostId:r.host_id||null,createdBy:r.created_by,createdAt:tms_(r.created_at)}));
@@ -667,7 +690,7 @@ const NAV = [
 const ADMIN_ONLY = ['admin','team'];
 function render(){
   const view=$('#view'), nav=$('#nav'), inApp=S.stage==='app';
-  const ub=$('#userBtn'); ub.hidden=!S.session; if(S.session) ub.textContent=(S.me&&(S.me.name||S.me.email))||'Account';
+  const ub=$('#userBtn'); ub.hidden=!S.session; if(S.session){ const label=(S.me&&(S.me.name||S.me.email))||'Account'; ub.replaceChildren(...(S.profiles[myId()]?[avatar(myId(),22)]:[]),label); }
   $('#newTaskTop').hidden=!(inApp&&S.canWrite);
   $('#side').hidden=!inApp; document.querySelector('.layout').classList.toggle('nosid',!inApp);
   if(!inApp){ nav.replaceChildren(); $('#overPill').replaceChildren(); view.replaceChildren(gateView()); return; }
@@ -699,7 +722,18 @@ function gateView(){
 function loginView(){
   const name=h('input',{type:'text',placeholder:'Your name (for new accounts)',autocomplete:'name'});
   const email=h('input',{type:'text',placeholder:'you@example.com',autocomplete:'email',inputmode:'email'});
-  const pw=h('input',{type:'password',placeholder:'Password (at least 6 characters)',autocomplete:'current-password',style:'width:100%;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:9px 11px'});
+  const pw=h('input',{type:'password',placeholder:'Password (at least 6 characters)',autocomplete:'current-password'});
+  const EYE='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+  const EYE_OFF='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.9 17.9A10.7 10.7 0 0 1 12 19c-6.4 0-10-7-10-7a18.5 18.5 0 0 1 5.1-5.9M9.9 5.2A10 10 0 0 1 12 5c6.4 0 10 7 10 7a18.6 18.6 0 0 1-2.2 3.2M1 1l22 22"/><path d="M14.1 14.1a3 3 0 1 1-4.2-4.2"/></svg>';
+  const eye=h('button',{type:'button',class:'pw-eye','aria-label':'Show password','aria-pressed':'false',title:'Show password'});
+  eye.innerHTML=EYE;
+  eye.addEventListener('click',()=>{
+    const show=pw.type==='password'; pw.type=show?'text':'password';
+    eye.innerHTML=show?EYE_OFF:EYE; eye.setAttribute('aria-pressed',show?'true':'false');
+    const t=show?'Hide password':'Show password'; eye.setAttribute('aria-label',t); eye.title=t;
+    pw.focus(); try{ pw.setSelectionRange(pw.value.length,pw.value.length); }catch(e){}
+  });
+  const pwBox=h('div',{class:'pw-wrap'},pw,eye);
   const msg=h('div',{class:'hint',role:'status',style:'min-height:20px;margin-top:8px'});
   const say=(t,bad)=>{ msg.textContent=t; msg.className=bad?'red':'hint'; };
   const need=()=>{ if(!/.+@.+\..+/.test(email.value.trim())){ say('Enter a valid email address.',true); return false; } return true; };
@@ -707,7 +741,7 @@ function loginView(){
   return h('div',{class:'panel',style:'max-width:440px;margin:30px auto'},
     brandLogo?h('img',{class:'login-logo',src:brandLogo,alt:'Ethiopian Nile Youth Network logo'}):null,
     h('h2',{style:'color:var(--navy);margin-bottom:4px',text:'Welcome'}), h('p',{class:'hint',style:'margin:0 0 14px',text:'Sign in to the Ethiopian Nile Youth Network task tracker.'}),
-    field('Name',name), field('Email',email), field('Password',pw),
+    field('Name',name), field('Email',email), field('Password',pwBox),
     h('div',{class:'actions',style:'justify-content:flex-start'},
       h('button',{class:'btn primary',onclick:()=>need()&&run(async()=>{ const {error}=await sb.auth.signInWithPassword({email:email.value.trim(),password:pw.value}); if(error) say(error.message,true); })},'Sign in'),
       h('button',{class:'btn',onclick:()=>need()&&run(async()=>{ if(pw.value.length<6){ say('Use a password of at least 6 characters.',true); return; } const {data,error}=await sb.auth.signUp({email:email.value.trim(),password:pw.value,options:{data:{full_name:name.value.trim()},emailRedirectTo:redirectUrl()}}); if(error){ say(error.message,true); return; } if(!data.session) say('Account created. Check your email to confirm it, then sign in.'); })},'Create account'),
@@ -731,11 +765,83 @@ function teamView(view){
       role, me?null:h('button',{class:'btn small'+(p.active?'':' primary'),onclick:()=>setP(p.id,p.role,!p.active)},p.active?'Deactivate':'Approve'));
   }):h('p',{class:'empty',text:'No people yet.'})));
 }
+/* ---------- profile photo ---------- */
+const AVATAR_PX = 400;                        // photos are cropped to a square and shrunk to this size before upload
+const AVATAR_MAX = 1024*1024;                 // a saved profile photo is never larger than 1 MB
+const AVATAR_PICK_MAX = 15*1024*1024;         // biggest picture a person may pick (it is shrunk automatically)
+function squareImage(file){
+  return new Promise((res,rej)=>{
+    const url=URL.createObjectURL(file), im=new Image();
+    const done=(fn,v)=>{ URL.revokeObjectURL(url); fn(v); };
+    im.onload=()=>{ try{
+      const w=im.naturalWidth, hh=im.naturalHeight, side=Math.min(w,hh), out=Math.min(AVATAR_PX,side);
+      const c=document.createElement('canvas'); c.width=c.height=out;
+      const ctx=c.getContext('2d'); ctx.fillStyle='#fff'; ctx.fillRect(0,0,out,out);
+      ctx.drawImage(im,(w-side)/2,(hh-side)/2,side,side,0,0,out,out);
+      c.toBlob(b=>b?done(res,b):done(rej,new Error('blob')),'image/jpeg',.86);
+    }catch(e){ done(rej,e); } };
+    im.onerror=()=>done(rej,new Error('decode'));
+    im.src=url;
+  });
+}
+async function uploadAvatar(blob){
+  if(blob.size>AVATAR_MAX){ const e=new Error('The photo is larger than 1 MB. Please choose a smaller picture.'); e.custom=true; throw e; }
+  const path=myId()+'/'+Date.now().toString(36)+'.jpg';   // a new file name each time, so old pictures never stay cached
+  const up=await sb.storage.from('avatars').upload(path,blob,{contentType:'image/jpeg',cacheControl:'31536000'});
+  if(up.error){ console.error(up.error); const e=new Error(/bucket not found/i.test(up.error.message)?'Profile photos are not set up yet. Run supabase-profile-photo.sql in the Supabase SQL Editor.':'Photo upload failed: '+up.error.message); e.custom=true; throw e; }
+  return path;
+}
+function photoField(p){
+  const st={blob:null,removed:false,url:''};
+  const slot=h('div'), msg=h('small',{class:'hint'});
+  const input=h('input',{type:'file',accept:'image/*',hidden:''});
+  const choose=h('button',{class:'btn small',type:'button',onclick:()=>input.click()},'Choose photo');
+  const remove=h('button',{class:'btn small danger',type:'button',onclick:()=>{ st.blob=null; st.removed=true; msg.textContent=''; paint(); }},'Remove photo');
+  const say=(t,bad)=>{ msg.textContent=t; msg.className=bad?'red':'hint'; };
+  function paint(){
+    if(st.url){ URL.revokeObjectURL(st.url); st.url=''; }
+    let node;
+    if(st.blob){ st.url=URL.createObjectURL(st.blob); node=h('img',{class:'av',style:'width:72px;height:72px',src:st.url,alt:'New profile photo'}); }
+    else if(!st.removed && p.avatarPath) node=avatar(p.id,72);
+    else node=h('span',{class:'av ini',style:'width:72px;height:72px;font-size:32px',text:(pn(p.id)[0]||'?').toUpperCase()});
+    slot.replaceChildren(node);
+    remove.hidden=!(st.blob||(!st.removed&&p.avatarPath));
+    choose.textContent=(st.blob||(!st.removed&&p.avatarPath))?'Change photo':'Choose photo';
+  }
+  input.addEventListener('change',async()=>{
+    const f=input.files[0]; input.value=''; if(!f) return;
+    if(!isImageFile(f)){ say('Please choose a picture (JPG, PNG or WebP).',true); return; }
+    if(f.size>AVATAR_PICK_MAX){ say('That picture is too large. Please choose one under '+Math.round(AVATAR_PICK_MAX/1048576)+' MB.',true); return; }
+    try{ st.blob=await squareImage(f); st.removed=false; say('Press Save to keep this photo.'); }
+    catch(e){ say('This picture could not be read. Please try a JPG or PNG.',true); }
+    paint();
+  });
+  paint();
+  const el=h('div',{},h('div',{class:'photo-edit'},slot,h('div',{class:'btns'},choose,remove)),input,msg);
+  return {el,st};
+}
 $('#userBtn').addEventListener('click',()=>{
   const p=S.profiles[myId()]||{};
   const name=h('input',{type:'text',value:p.name||''}), phone=h('input',{type:'text',value:p.phone||'',placeholder:'+251911223344',inputmode:'tel'});
-  openForm('My profile',[field('Name',name),field('WhatsApp number',phone,'Include the country code. Teammates can then message you directly on WhatsApp.'),h('div',{class:'field'},h('label',{class:'chk'},h('input',{type:'checkbox',checked:bgOn()?'':null,onchange:e=>setBg(e.target.checked)}),'Show the Nile picture in the menu and background')),h('div',{class:'field'},h('button',{class:'btn small',onclick:()=>{ $('#dForm').close(); signOut(); }},'Sign out'))],async()=>{
-    await dbw(sb.from('profiles').update({full_name:name.value.trim(),phone:phone.value.trim()}).eq('id',myId())); await reload(); toast('Profile saved');
+  const photo=p.active?photoField(p):null;
+  openForm('My profile',[
+    photo?field('Profile photo',photo.el,'Your photo is cropped to a square and shrunk automatically. Teammates see it next to your name.'):field('Profile photo',h('p',{class:'hint',style:'margin:0',text:'You can add a photo once an admin approves your account.'})),
+    field('Name',name),field('WhatsApp number',phone,'Include the country code. Teammates can then message you directly on WhatsApp.'),
+    h('div',{class:'field'},h('label',{class:'chk'},h('input',{type:'checkbox',checked:bgOn()?'':null,onchange:e=>setBg(e.target.checked)}),'Show the Nile picture in the menu and background')),
+    h('div',{class:'field'},h('button',{class:'btn small',onclick:()=>{ $('#dForm').close(); signOut(); }},'Sign out'))
+  ],async()=>{
+    const patch={full_name:name.value.trim(),phone:phone.value.trim()};
+    let newPath=null;
+    if(photo&&photo.st.blob){ newPath=await uploadAvatar(photo.st.blob); patch.avatar_path=newPath; }
+    else if(photo&&photo.st.removed&&p.avatarPath) patch.avatar_path='';
+    try{ await dbw(sb.from('profiles').update(patch).eq('id',myId())); }
+    catch(e){
+      if(newPath){ try{ await sb.storage.from('avatars').remove([newPath]); }catch(_){} }
+      if(/avatar_path/i.test(e.message||'')){ const c=new Error('Profile photos are not set up yet. Run supabase-profile-photo.sql in the Supabase SQL Editor.'); c.custom=true; throw c; }
+      throw e;
+    }
+    if('avatar_path' in patch && p.avatarPath){ try{ await sb.storage.from('avatars').remove([p.avatarPath]); }catch(e){} }   // delete the old picture
+    await reload(); toast('Profile saved');
   });
 });
 $('#newTaskTop').addEventListener('click',()=>taskForm());
@@ -1906,6 +2012,7 @@ function makeDemoClient(){
     upload:async(path,file)=>{ demoBlobs[path]=URL.createObjectURL(file); return {data:{path},error:null}; },
     createSignedUrls:async paths=>({data:paths.map(p=>({path:p,signedUrl:demoBlobs[p]||null,error:null})),error:null}),
     createSignedUrl:async p=>({data:{signedUrl:demoBlobs[p]},error:null}),
+    getPublicUrl:p=>({data:{publicUrl:demoBlobs[p]||''}}),
     remove:async paths=>{ paths.forEach(p=>{ delete demoBlobs[p]; }); return {data:[],error:null}; } })};
   return {from,rpc,storage,channel:()=>({on(){return this},subscribe(){return this}}),
     auth:{getSession:async()=>({data:{session:S.session}}),onAuthStateChange:()=>({data:{subscription:{unsubscribe(){}}}}),signOut:async()=>{},signInWithPassword:nope,signUp:nope,signInWithOtp:nope}};
