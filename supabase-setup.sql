@@ -9,6 +9,7 @@ create table public.profiles (
   email       text,
   full_name   text not null default '',
   phone       text not null default '',
+  avatar_path text not null default '',
   role        text not null default 'member' check (role in ('admin','member')),
   active      boolean not null default false,
   committee_position    text not null default '' check (committee_position in ('','chair','vice_chair','secretary','advocacy','communication','treasurer','coordinator')),
@@ -275,11 +276,11 @@ revoke all on public.profiles, public.tasks, public.task_updates, public.meeting
   public.training_docs, public.finance_entries, public.finance_budgets, public.app_settings from anon;
 
 -- profiles: approved people see everyone; everyone sees themselves.
--- People can edit only their own name and WhatsApp number (not role, committee_position or approval).
+-- People can edit only their own name, WhatsApp number and profile photo (not role, committee_position or approval).
 create policy "profiles read" on public.profiles for select to authenticated using (id = auth.uid() or public.is_active());
 create policy "profiles edit own" on public.profiles for update to authenticated using (id = auth.uid()) with check (id = auth.uid());
 revoke insert, update, delete on public.profiles from authenticated;
-grant update (full_name, phone) on public.profiles to authenticated;
+grant update (full_name, phone, avatar_path) on public.profiles to authenticated;
 
 -- tasks: any approved member reads, creates and updates; delete by admin or creator
 create policy "tasks read"   on public.tasks for select to authenticated using (public.is_active());
@@ -358,6 +359,19 @@ create policy "files upload" on storage.objects for insert to authenticated
   with check (bucket_id = 'attachments' and public.is_active() and (storage.foldername(name))[1] = auth.uid()::text);
 create policy "files delete" on storage.objects for delete to authenticated
   using (bucket_id = 'attachments' and (public.is_admin() or (storage.foldername(name))[1] = auth.uid()::text));
+
+-- ---------- Profile photos (public bucket 'avatars': one small square picture per person) ----------
+-- Pictures are public by URL so they load instantly everywhere; each person can only add or delete inside their own folder.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('avatars', 'avatars', true, 1048576, array['image/jpeg','image/png','image/webp'])
+on conflict (id) do update set public = true, file_size_limit = 1048576, allowed_mime_types = array['image/jpeg','image/png','image/webp'];
+
+create policy "avatars read" on storage.objects for select to authenticated
+  using (bucket_id = 'avatars');
+create policy "avatars upload own" on storage.objects for insert to authenticated
+  with check (bucket_id = 'avatars' and public.is_active() and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "avatars delete own" on storage.objects for delete to authenticated
+  using (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
 
 -- ---------- Live updates (everyone sees changes without refreshing) ----------
 alter publication supabase_realtime add table
