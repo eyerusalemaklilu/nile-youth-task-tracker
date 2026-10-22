@@ -410,18 +410,19 @@ img.av{background:var(--gray-soft)}
 html.has-photo .page-head.people-head{align-items:stretch;min-height:0;padding:16px 22px 12px}
 .people-head .ph-date{margin:0;font-weight:600;font-size:15px}
 .pstrip{display:flex;gap:4px;overflow-x:auto;scroll-snap-type:x proximity;padding:4px 2px 6px;scrollbar-width:thin;-webkit-overflow-scrolling:touch}
-.pbtn{flex:0 0 auto;width:86px;background:none;border:0;padding:6px 2px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:inherit;border-radius:14px;scroll-snap-align:start}
+.pbtn{flex:0 0 auto;width:104px;background:none;border:0;padding:6px 2px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;color:inherit;border-radius:14px;scroll-snap-align:start}
 .pbtn:hover,.pbtn:focus-visible{background:color-mix(in srgb,currentColor 12%,transparent)}
 .pav{position:relative;display:inline-block;line-height:0}
 .pav .av{border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.28)}
-.pdot{position:absolute;right:0;bottom:1px;width:14px;height:14px;border-radius:50%;border:2.5px solid var(--dot-ring,#fff);background:#9CA3AF}
+.pdot{position:absolute;right:1px;bottom:2px;width:17px;height:17px;border-radius:50%;border:2.5px solid var(--dot-ring,#fff);background:#9CA3AF}
 .pdot.on{background:#22C55E}
-.pname{font-weight:600;font-size:13px;line-height:1.2;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ppos{font-size:11px;line-height:1.2;opacity:.88;text-align:center;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:2.4em}
+.pname{font-weight:600;font-size:14px;line-height:1.2;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ppos{font-size:12px;line-height:1.2;opacity:.88;text-align:center;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:2.4em}
 @media (max-width:520px){
   html.has-photo .page-head.people-head{padding:14px 14px 8px}
-  .pbtn{width:76px}
-  .pav .av{width:48px !important;height:48px !important;font-size:21px !important}
+  .pbtn{width:88px}
+  .pav .av{width:58px !important;height:58px !important;font-size:25px !important}
+  .pdot{width:15px;height:15px}
 }
 
 /* ---- Profile pop-up ---- */
